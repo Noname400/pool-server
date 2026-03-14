@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+      "mcp__plugin_context-mode_context-mode__ctx_search",
+      "Bash(python3 -c \"\nimport py_compile\nimport os\nerrors = []\nfor root, dirs, files in os.walk\\('app'\\):\n    for f in files:\n        if f.endswith\\('.py'\\):\n            path = os.path.join\\(root, f\\)\n            try:\n                py_compile.compile\\(path, doraise=True\\)\n            except py_compile.PyCompileError as e:\n                errors.append\\(str\\(e\\)\\)\nif errors:\n    for e in errors:\n        print\\(e\\)\nelse:\n    print\\('All files OK'\\)\n\")",
+      "Bash(cd /Users/evgenijmalogricenko/github/pool_server/frontend && npm install 2>&1 | tail -15)",
+      "Bash(pip install -r requirements.txt 2>&1 | tail -5)",
+      "Bash(pip3 install -r requirements.txt 2>&1 | tail -5)",
+      "Bash(python3 -m venv .venv && .venv/bin/pip install -r requirements.txt 2>&1 | tail -10)",
+      "Bash(cd /Users/evgenijmalogricenko/github/pool_server/frontend && npx vite build 2>&1)",
+      "Bash(.venv/bin/python3 -c \"from app.config import settings; print\\('config OK'\\)\")",
+      "Bash(.venv/bin/python3 -c \"from app.db.models import User, ApiKey, GPU, Chunk, Find, Earning, Withdrawal, HashrateLog, AuditLog, Settings; print\\('models OK'\\)\")",
+      "Bash(.venv/bin/python3 -c \"from app.auth.api_keys import generate_api_key, hash_api_key, validate_key_format; k,h = generate_api_key\\(\\); print\\(f'key={k} valid={validate_key_format\\(k\\)}'\\); print\\('api_keys OK'\\)\")",
+      "Bash(.venv/bin/python3 -c \"from app.main import app; print\\(f'routes: {len\\(app.routes\\)}'\\); print\\('main OK'\\)\")",
+      "Bash(psql postgres -c \"CREATE DATABASE pool_server;\" 2>&1 || echo \"DB may already exist\")",
+      "Bash(psql postgres -c \"CREATE USER postgres WITH PASSWORD 'postgres';\" 2>&1; psql postgres -c \"GRANT ALL PRIVILEGES ON DATABASE pool_server TO postgres;\" 2>&1; psql postgres -c \"ALTER DATABASE pool_server OWNER TO postgres;\" 2>&1; echo \"Done with user/grants\")",
+      "Bash(openssl rand -hex 16)",
+      "Bash(source .venv/bin/activate && python -c \"from app.main import app; print\\('Import OK'\\)\" 2>&1)",
+      "mcp__plugin_context-mode_context-mode__ctx_execute",
+      "Bash(kill 64587 2>/dev/null; echo \"Server stopped\")",
+      "Bash(chmod +x /Users/evgenijmalogricenko/github/pool_server/deploy.sh /Users/evgenijmalogricenko/github/pool_server/setup-server.sh /Users/evgenijmalogricenko/github/pool_server/scripts/backup.sh /Users/evgenijmalogricenko/github/pool_server/scripts/restore.sh /Users/evgenijmalogricenko/github/pool_server/scripts/create-admin.sh /Users/evgenijmalogricenko/github/pool_server/scripts/health-check.sh && echo \"Done\")",
+      "Bash(source .venv/bin/activate && python3 -c \"from app.main import app; print\\(f'Routes: {len\\(app.routes\\)}'\\); print\\('OK'\\)\")",
+      "Bash(source .venv/bin/activate && python3 -c \"from app.main import app; print\\('Security audit fixes applied, app OK'\\)\")",
+      "Bash(lsof -ti:8420 | xargs kill -9 2>/dev/null; sleep 2)",
+      "Bash(cd /Users/evgenijmalogricenko/github/pool_server/frontend && npm run build 2>&1 | tail -20)",
+      "Bash(source .venv/bin/activate && python3 -c \"from app.main import app; print\\(f'Routes: {len\\(app.routes\\)}'\\); print\\('OK'\\)\" 2>&1)",
+      "Bash(lsof -ti:8420 | xargs kill -9 2>/dev/null; sleep 1; source .venv/bin/activate && python3 -c \"\nimport asyncio\nfrom app.db.session import engine\nfrom app.db.base import Base\nfrom app.db import models  # ensure all models loaded\n\nasync def reset\\(\\):\n    async with engine.begin\\(\\) as conn:\n        await conn.run_sync\\(Base.metadata.drop_all\\)\n        await conn.run_sync\\(Base.metadata.create_all\\)\n    print\\('All tables recreated'\\)\n\nasyncio.run\\(reset\\(\\)\\)\n\")",
+      "Bash(source .venv/bin/activate && python3 -c \"\nimport asyncio\nfrom app.db.session import async_session_factory\nfrom app.db.models import ApiKey\nfrom sqlalchemy import select\n\nasync def get_key\\(\\):\n    async with async_session_factory\\(\\) as s:\n        r = await s.execute\\(select\\(ApiKey\\).where\\(ApiKey.role == 'admin'\\)\\)\n        k = r.scalar_one_or_none\\(\\)\n        if k:\n            print\\(f'prefix: {k.key_prefix}'\\)\n            print\\(f'hash: {k.key_hash}'\\)\n\nasyncio.run\\(get_key\\(\\)\\)\n\")",
+      "Bash(source .venv/bin/activate && python3 -c \"\nimport asyncio\nfrom app.db.session import async_session_factory\nfrom app.db.models import ApiKey, User\nfrom app.auth.api_keys import generate_api_key, hash_api_key\nfrom sqlalchemy import select\n\nasync def new_key\\(\\):\n    async with async_session_factory\\(\\) as s:\n        r = await s.execute\\(select\\(User\\).where\\(User.role == 'admin'\\)\\)\n        user = r.scalar_one\\(\\)\n        key, key_hash = generate_api_key\\(\\)\n        api_key = ApiKey\\(\n            user_id=user.id,\n            key_hash=key_hash,\n            key_prefix=key[:4],\n            label='admin-new',\n            role='admin',\n            is_active=True,\n        \\)\n        s.add\\(api_key\\)\n        await s.commit\\(\\)\n        print\\(key\\)\n\nasyncio.run\\(new_key\\(\\)\\)\n\")",
+      "Bash(cd /Users/evgenijmalogricenko/github/pool_server/frontend && npm run build 2>&1 | tail -5)",
+      "Bash(npm run build 2>&1 | tail -3)",
+      "Bash(npm run build 2>&1 | tail -10)",
+      "Bash(cd /Users/evgenijmalogricenko/github/pool_server && source .venv/bin/activate && python3 -c \"from app.main import app; print\\(f'Routes: {len\\(app.routes\\)}'\\); print\\('OK'\\)\")"
+    ]
+  }
+}

@@ -1,0 +1,46 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Environment
+.env
+.env.production
+.env.staging
+
+# Database
+pool.db
+*.db
+*.sql.gz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# SSL certs
+ssl/
+
+# Backups
+backups/
+
+# Build artifacts
+*.tar.gz

@@ -1,0 +1,19 @@
+# Pool Server v2: single container + system KeyDB + system Nginx
+# KeyDB and Nginx run as systemd services on the host.
+#
+# Usage:
+#   docker compose up -d
+#
+services:
+  pool:
+    image: bbdata/pool-server:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pool-app
+    network_mode: host
+    volumes:
+      - /data/pool:/data
+    env_file:
+      - .env
+    restart: unless-stopped
