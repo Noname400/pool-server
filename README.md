@@ -1,44 +1,42 @@
 # GPU Pool Server v2
 
 Центральный сервер управления пулом GPU-вычислений.  
-FastAPI + React SPA + SQLite (persistent) + KeyDB (in-memory). Один Docker-контейнер, Nginx и KeyDB работают на хосте как systemd-сервисы.
+FastAPI + React SPA + SQLite + KeyDB. Один Docker-контейнер. Nginx и KeyDB — systemd-сервисы на хосте.
 
 ## Архитектура
 
 ```
-Trainer (GPU)                     Pool Server (training.bbdata.net)
+Trainer (GPU)                     Pool Server
   │                                 │
   │  HTTPS (Cloudflare → Nginx)     │
   ├─ GET  /get_number?count=N ─────►│──► KeyDB: INCRBY partx:step
-  │◄─ {"numbers":[...], "command"}  │      SET active:{x} (TTL 300s)
+  │◄─ {"numbers":[...], "command"}  │      SET active:{x} (TTL)
+  │                                 │      touch alive:{id}
+  │                                 │      UPSERT machines (X-GPU-Count и др.)
   │                                 │
   ├─ POST /mark_done {nums:[...]} ─►│──► KeyDB: INCRBY completed:count
-  │◄─ {"ok":true}                   │      DEL active:{x}
+  │◄─ {"ok":true}                   │      DEL active:{x}, touch alive
   │                                 │
   ├─ POST /set_found {x, y} ──────►│──► SQLite: INSERT found_keys
-  │◄─ {"ok":true}                   │
+  │◄─ {"ok":true}                   │      touch alive
   │                                 │
-  │  (implicit heartbeat:           │──► KeyDB: SET alive:{id} (TTL 60s)
-  │   every request = alive)        │──► SQLite: UPSERT machines (throttled 30s)
   └─────────────────────────────────┘
 
 Admin UI (React SPA)
-  │
   ├─ /admin              Overview: step, completed, found, machines online
-  ├─ /admin/machines     Список машин (online/offline), команды stop/pause/restart
+  ├─ /admin/machines     Fleet view: машины по IP, GPU × count, команды
   ├─ /admin/found-keys   Таблица найденных ключей
   ├─ /admin/connect      Инструкция подключения трейнеров
-  ├─ /admin/settings     PartX start/step, Telegram, test seeds, auth token
-  └─ /admin/test         Тестовый стенд (конкретные X значения)
+  └─ /admin/settings     PartX start/step, Telegram, test seeds, auth token
 ```
 
-### Разделение хранилищ
+### Хранилища
 
-| Хранилище | Данные | Скорость | Персистентность |
-|-----------|--------|----------|-----------------|
-| **KeyDB** | step, completed count, alive machines, active X | ~200+ RPS | нет (восстанавливается из SQLite) |
-| **SQLite** | users, api_keys, machines, found_keys, settings, test_items, machine_verify | ~50 RPS | да (WAL mode) |
-| **In-process cache** | verified machines, test_mode flag, last DB write time | мгновенно | нет |
+| Хранилище | Данные | Персистентность |
+|-----------|--------|------------------|
+| **KeyDB** | partx:step, completed, alive:{id}, active:{x}, cmd:{id} | нет (восст. из SQLite) |
+| **SQLite** | users, api_keys, machines, found_keys, settings, test_items, machine_verify | да (WAL) |
+| **In-memory** | verified machines, test_mode, last DB write | нет |
 
 ## Файлы
 
@@ -46,84 +44,82 @@ Admin UI (React SPA)
 
 | Файл | Назначение |
 |------|-----------|
-| `main.py` | FastAPI app, lifespan (init DB/KeyDB, restore state, create admin), SPA serving |
+| `main.py` | FastAPI, lifespan, SPA serve |
 | `config.py` | Pydantic Settings из `.env` |
-| `cache/keydb.py` | KeyDB клиент: step/start/completed counters, alive TTL, active X tracking |
-| `db/sqlite.py` | SQLite схема (6 таблиц) + все CRUD функции |
+| `cache/keydb.py` | KeyDB: step/completed, alive TTL, active X, pending commands |
+| `db/sqlite.py` | SQLite schema + CRUD |
 | `workers/trainer_router.py` | Trainer API: get_number, mark_done, set_found, stats, machines, found_keys |
-| `workers/partx_generator.py` | PartX раздача через KeyDB INCRBY (atomic, 0 contention), MAX_X = 2^32-1 |
-| `dashboard/admin_router.py` | Admin API: stats, machines CRUD, commands, settings, test stand, found keys |
-| `background/tasks.py` | Фоновые задачи: persist KeyDB→SQLite (10s), Telegram stats |
-| `auth/router.py` | Login (API key → JWT cookie), Logout, Me |
-| `auth/dependencies.py` | JWT/API key validation, `require_admin` |
-| `auth/api_keys.py` | Генерация и SHA-256 хеширование API ключей |
-| `security/middleware.py` | CORS, security headers (HSTS, CSP, X-Frame), request logging |
-| `notifications/telegram.py` | Telegram Bot API уведомления |
+| `workers/partx_generator.py` | PartX: атомарный INCRBY, MAX_X = 2^32-1 |
+| `dashboard/admin_router.py` | Admin API: stats, machines, commands, settings, test API, found keys |
+| `background/tasks.py` | persist KeyDB→SQLite (10s), Telegram stats |
+| `auth/*` | Login (API key → JWT), Logout, Me, require_admin |
+| `security/middleware.py` | CORS, CSP, HSTS, request logging |
 
 ### Frontend (`frontend/src/pages/admin/`)
 
 | Страница | Назначение |
 |----------|-----------|
 | `Overview.jsx` | Дашборд: step, completed, progress %, found keys, machines online |
-| `Machines.jsx` | Список машин с online/offline статусом, модальное окно с деталями, команды |
-| `FoundKeys.jsx` | Таблица всех найденных ключей (x, y, machine, time) |
-| `Connect.jsx` | Инструкция подключения трейнеров (URL, headers, curl пример) |
-| `Settings.jsx` | Настройки PartX, Telegram, test seeds, auth token (read-only) |
-| `TestStand.jsx` | Тестовый стенд: ввод X значений, запуск/остановка, результаты |
+| `Machines.jsx` | Fleet view: группировка по IP, GPU × count, онлайн/офлайн точки |
+| `FoundKeys.jsx` | Таблица найденных ключей |
+| `Connect.jsx` | URL, headers, curl пример подключения |
+| `Settings.jsx` | PartX, Telegram, test seeds, auth token (read-only) |
 
-## База данных (SQLite)
+## SQLite
 
 ### Таблицы
 
 ```
 users            — id, username, role, email, is_active, created_at
-api_keys         — id, user_id, key_hash, key_prefix, label, role, is_active, last_used_at/ip
-machines         — machine_id, hostname, ip, name, tags, gpu_name/count/mem, version,
-                   pending_command, verified, first_seen, last_seen
-machine_verify   — machine_id + x_value (PK), found, found_at
+api_keys         — key_hash, key_prefix, user_id, label, role
+machines         — machine_id, hostname, ip, name, tags, gpu_name, gpu_count, gpu_mem_mb,
+                   version, pending_command, verified, first_seen, last_seen
+machine_verify   — machine_id, x_value (PK), found, found_at
 found_keys       — id, x_value, y_value, machine_id, found_at
 settings         — key (PK), value, updated_at
 test_items       — id, x_value, status, machine_id, assigned_at, completed_at, found, found_y, found_at
 ```
 
-## KeyDB (in-memory)
+## KeyDB
 
-| Ключ | Тип | TTL | Назначение |
-|------|-----|-----|-----------|
-| `partx:step` | int | — | Текущий указатель раздачи X |
-| `partx:start` | int | — | Нижняя граница (задаётся в Settings) |
-| `completed:count` | int | — | Общий счётчик обработанных X |
-| `alive:{machine_id}` | "1" | 60s | Машина жива (implicit heartbeat) |
-| `active:{x_number}` | machine_id | 300s | X в работе (stuck detection) |
+| Ключ | Назначение |
+|------|-----------|
+| `partx:step` | Текущий указатель раздачи X |
+| `partx:start` | Нижняя граница (Settings) |
+| `completed:count` | Счётчик обработанных X |
+| `alive:{machine_id}` | Машина жива, TTL = MACHINE_ALIVE_TTL |
+| `active:{x}` | X в работе, TTL = ACTIVE_X_TTL (stuck detection) |
+| `cmd:{machine_id}` | pending command (stop/pause/restart), TTL 3600 |
 
-Каждые 10 секунд `persist_keydb_state` сохраняет `partx:step` и `completed:count` в SQLite settings. При старте пула `_restore_keydb_state` восстанавливает эти значения из SQLite если KeyDB пуст.
+Персистентность: каждые 10 сек `partx:step` и `completed:count` сохраняются в SQLite. При старте восстанавливаются, если KeyDB пуст.
 
 ## API
 
-### Trainer API (без префикса)
+### Trainer (без префикса)
 
 | Метод | Путь | Auth | Описание |
 |-------|------|------|----------|
 | GET | `/status` | — | Health check |
-| GET | `/get_number?count=N` | Token + X-Machine-Id | Запрос X номеров (max 1000) |
-| POST | `/mark_done` | Token + X-Machine-Id | Пометка X как обработанные |
+| GET | `/get_number?count=N` | Token + X-Machine-Id | Запрос X (max 1000), count=0 — только регистрация |
+| POST | `/mark_done` | Token + X-Machine-Id | Пометка X обработанными |
 | POST | `/set_found` | Token + X-Machine-Id | Сообщение о находке (x, y) |
-| GET | `/stats` | Token | Статистика кластера |
+| GET | `/stats` | Token | Статистика |
 | GET | `/machines` | Token | Список машин |
 | GET | `/found_keys` | Token | Найденные ключи |
 
-**Headers трейнера:**
+**Headers трейнера** (обновляются при get_number, mark_done, set_found):
+
 ```
 Authorization: <TRAINER_AUTH_TOKEN>
-X-Machine-Id: <hostname-based unique id>
+X-Machine-Id: <unique id>
 X-Hostname: <hostname>
-X-GPU-Name: <gpu model>
-X-GPU-Count: <number>
+X-GPU-Name: <model>
+X-GPU-Count: <число карт>
 X-GPU-Mem: <MB>
-X-Version: <trainer version>
+X-Version: <version>
 ```
 
-### Admin API (`/api/admin`)
+### Admin (`/api/admin`)
 
 | Метод | Путь | Описание |
 |-------|------|----------|
@@ -132,14 +128,14 @@ X-Version: <trainer version>
 | GET | `/machines/{id}` | Детали машины |
 | PATCH | `/machines/{id}` | Обновить name/tags |
 | DELETE | `/machines/{id}` | Удалить машину |
-| POST | `/machines/{id}/command` | Команда (stop/pause/restart) |
+| POST | `/machines/{id}/command` | Команда: stop / pause / restart |
 | POST | `/machines/command-all` | Команда всем (фильтр: online, tag) |
 | GET | `/found-keys` | Найденные ключи |
-| GET/POST | `/settings` | Настройки пула |
+| GET/POST | `/settings` | Настройки |
 | POST | `/test/start` | Запуск теста {x_values} |
 | POST | `/test/stop` | Остановка теста |
 | GET | `/test/status` | Статус теста |
-| GET | `/users` | Список пользователей |
+| GET | `/users` | Пользователи |
 
 ### Auth (`/api/auth`)
 
@@ -151,34 +147,27 @@ X-Version: <trainer version>
 
 ## PartX Generator
 
-Пространство X: `0 .. 2^32-1` (4 294 967 295).
+Пространство X: `0 .. 2^32-1`.
 
 ```
-Trainer → GET /get_number?count=10
-  │
-  Pool:
-  │  1. ensure_step_above_start()     — KeyDB: if step < start → step = start
-  │  2. claim_range(10)               — KeyDB: INCRBY partx:step 10 (atomic)
-  │  3. range(start, min(start+10, MAX_X))
-  │  4. pipeline SET active:{x} machine_id EX 300  (×10)
-  │
-  └→ {"numbers": [100..109], "command": "work"}
+1. ensure_step_above_start()  — KeyDB: step ≥ start
+2. claim_range(count)        — INCRBY partx:step (атомарно)
+3. range(start, min(start+count, MAX_X))
+4. pipeline SET active:{x} machine_id EX ACTIVE_X_TTL
 ```
 
-- **Раздача**: атомарный INCRBY — нет блокировок, нет дублей
-- **Stuck detection**: active ключи с TTL 300s автоматически истекают
-- **Завершение**: mark_done → INCRBY completed:count + DEL active:{x}
+- **mark_done** → INCRBY completed:count + DEL active:{x}
+- Stuck: active с TTL автоматически истекают
 
-## Верификация новых машин
+## Верификация машин
 
-Когда `test_seeds` заданы в настройках (через запятую), новая машина сначала получает эти seed-значения с `command: "verify"`. Трейнер должен найти Y для каждого X и отправить через `/set_found`. Когда все seeds найдены — машина помечается `verified=1` и начинает получать реальные X из диапазона.
+При `test_seeds` в настройках (через запятую) новая машина сначала получает эти X с `command: "verify"`. Трейнер находит Y и шлёт `/set_found`. После всех seeds — `verified=1`, машина получает реальные X.
 
-## Управление машинами
+## Команды машинам
 
-Команды (stop/pause/restart) доставляются через `pending_command`:
-1. Admin UI → `POST /machines/{id}/command` → SQLite: `UPDATE machines SET pending_command='stop'`
-2. Trainer → `GET /get_number` → SQLite: `SELECT/consume pending_command`
-3. Trainer получает `{"numbers":[], "command":"stop"}` и останавливается
+1. Admin → `POST /machines/{id}/command` → KeyDB: `SET cmd:{id}`
+2. Trainer → `GET /get_number` → KeyDB: `GETDEL cmd:{id}`
+3. Трейнер получает `{"numbers":[], "command":"stop"}` и останавливается
 
 ## Docker
 
@@ -196,12 +185,15 @@ docker run -d \
   bbdata/pool-server:latest
 ```
 
-### docker-compose.yml
+### docker-compose
 
 ```yaml
 services:
   pool:
     image: bbdata/pool-server:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: pool-app
     network_mode: host
     volumes:
@@ -215,16 +207,16 @@ services:
 
 | Переменная | Default | Описание |
 |-----------|---------|----------|
-| `DATA_DIR` | `/data` | Путь к SQLite базе (pool.db) |
-| `KEYDB_URL` | `redis://127.0.0.1:6379/0` | URL подключения к KeyDB |
+| `DATA_DIR` | `/data` | Путь к SQLite (pool.db) |
+| `KEYDB_URL` | `redis://127.0.0.1:6379/0` | KeyDB/Redis URL (с паролем: `redis://:pass@host:port/0`) |
 | `SECRET_KEY` | auto | JWT signing key |
-| `TRAINER_AUTH_TOKEN` | — | Токен авторизации трейнеров |
+| `TRAINER_AUTH_TOKEN` | — | Токен трейнеров (**обязательно**) |
 | `CORS_ORIGINS` | — | Allowed origins (через запятую) |
-| `TELEGRAM_BOT_TOKEN` | — | Telegram Bot API token |
+| `TELEGRAM_BOT_TOKEN` | — | Telegram Bot API |
 | `TELEGRAM_CHAT_ID` | — | Telegram chat ID |
-| `TELEGRAM_STATS_INTERVAL` | `15` | Интервал Telegram статистики (мин, 0=откл) |
-| `MACHINE_ALIVE_TTL` | `60` | TTL alive ключа в KeyDB (сек) |
-| `ACTIVE_X_TTL` | `300` | TTL active X ключа в KeyDB (сек) |
+| `TELEGRAM_STATS_INTERVAL` | `15` | Интервал Telegram (мин, 0=выкл) |
+| `MACHINE_ALIVE_TTL` | `60` | TTL alive в KeyDB (сек) |
+| `ACTIVE_X_TTL` | `300` | TTL active X (сек) |
 | `HOST` | `0.0.0.0` | Bind host |
 | `PORT` | `8421` | Bind port |
 | `DEBUG` | `false` | Debug mode |
@@ -234,41 +226,40 @@ services:
 | Пакет | Назначение |
 |-------|-----------|
 | fastapi | Web framework |
-| uvicorn[standard] | ASGI server |
+| uvicorn[standard] | ASGI |
 | pydantic-settings | Config from env |
-| aiosqlite | Async SQLite driver |
-| redis | KeyDB/Redis async client |
-| httpx | HTTP client (Telegram) |
+| aiosqlite | Async SQLite |
+| redis | KeyDB/Redis async |
+| httpx | HTTP (Telegram) |
 | python-jose[cryptography] | JWT |
 | python-multipart | Form data |
+| bcrypt | Password hashing |
 
 ## Фоновые задачи
 
-| Задача | Интервал | Что делает |
-|--------|----------|-----------|
-| `persist_keydb_state` | 10 сек | Сохраняет `partx:step` и `completed:count` из KeyDB в SQLite settings |
-| `telegram_stats_loop` | настраиваемый | Отправляет статистику кластера в Telegram |
+| Задача | Интервал | Действие |
+|--------|----------|----------|
+| `persist_keydb_state` | 10 сек | Сохраняет step, completed в SQLite |
+| `telegram_stats_loop` | настраиваемый | Статистика в Telegram |
 
 ## Безопасность
 
 | Уровень | Защита |
 |---------|--------|
-| Cloudflare | WAF, DDoS, TLS termination |
-| Nginx (хост) | Origin Certificate, rate limiting, security headers |
+| Cloudflare | WAF, DDoS, TLS |
+| Nginx | Origin cert, rate limit, security headers |
 | CORS | Whitelist origins |
-| Trainer auth | `TRAINER_AUTH_TOKEN` (hmac.compare_digest) |
-| Admin auth | JWT cookie (HttpOnly, SameSite=Strict, Secure) |
-| API key auth | SHA-256 hash, 128-bit entropy |
-| Request logging | IP, method, path, timing, X-Request-ID |
-| Security headers | HSTS, X-Frame-Options DENY, CSP, nosniff |
+| Trainer | TRAINER_AUTH_TOKEN (hmac) |
+| Admin | JWT cookie (HttpOnly, SameSite=Strict, Secure) |
+| API keys | bcrypt (legacy SHA-256) |
+| CSP | scripts, styles, fonts (Google Fonts) |
 
-## Lifecycle
+## Первый запуск
 
-```
-1. init_db()             → SQLite: CREATE TABLE IF NOT EXISTS (7 таблиц), WAL mode
-2. init_keydb()          → KeyDB: PING
-3. _restore_keydb_state()→ Если KeyDB пуст — восстановить step/completed из SQLite
-4. Create admin user     → Если нет админа — создать + вывести API key в лог
-5. Background tasks      → persist_keydb_state + telegram_stats_loop
-6. Uvicorn serve         → :8421
-```
+1. `init_db()` — SQLite schema, WAL
+2. `init_keydb()` — подключение к KeyDB
+3. `_restore_keydb_state()` — step/completed из SQLite при пустом KeyDB
+4. Если нет admin — создаётся admin + API key в лог (**сохраните!**)
+5. Background tasks + Uvicorn :8421
+
+Создать новый API key: `scripts/create-admin.sh`
