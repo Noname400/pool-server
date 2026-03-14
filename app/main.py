@@ -13,13 +13,14 @@ from fastapi.staticfiles import StaticFiles
 
 from app.auth.api_keys import generate_api_key
 from app.auth.router import router as auth_router
-from app.background.tasks import persist_keydb_state, telegram_stats_loop
+from app.background.tasks import persist_keydb_state, requeue_expired_leases, telegram_stats_loop
 from app.cache import keydb
 from app.cache.keydb import close_keydb, init_keydb
 from app.config import get_settings
 from app.dashboard.admin_router import router as admin_router
 from app.db.sqlite import close_db_pool, create_api_key, create_user, get_db, get_setting, init_db, list_users
 from app.security.middleware import setup_middleware
+from app.export_router import router as export_router
 from app.workers.trainer_router import router as trainer_router
 
 logging.basicConfig(
@@ -72,6 +73,7 @@ async def lifespan(app: FastAPI):
 
     _background_tasks = [
         asyncio.create_task(persist_keydb_state()),
+        asyncio.create_task(requeue_expired_leases()),
         asyncio.create_task(telegram_stats_loop()),
     ]
 
@@ -109,6 +111,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 app.include_router(auth_router)
 app.include_router(trainer_router)
 app.include_router(admin_router)
+app.include_router(export_router)
 
 # ---------------------------------------------------------------------------
 # SPA serving

@@ -1,8 +1,8 @@
 """
-app/workers/trainer_router.py — Trainer-facing API (pool v2).
+app/workers/trainer_router.py — Trainer-facing API (pool v3, lease-based).
 
 Direct HTTPS, implicit heartbeat, auto-registration.
-SQLite writes throttled: machine info updated at most once per MACHINE_ALIVE_TTL.
+SQLite writes throttled: machine info updated at most once per _DB_WRITE_INTERVAL.
 """
 import hmac
 import logging
@@ -118,15 +118,29 @@ def _is_verified_cached(machine_id: str) -> bool:
     return machine_id in _verified_cache
 
 
+def _empty_response(command: str) -> dict:
+    return {"numbers": [], "leases": {}, "lease_ttl": settings.LEASE_TTL, "command": command}
+
+
+def _batch_response(items: list[dict], command: str = "work") -> dict:
+    numbers = [it["x"] for it in items]
+    leases = {str(it["x"]): it["lease_id"] for it in items}
+    return {
+        "numbers": numbers,
+        "leases": leases,
+        "lease_ttl": settings.LEASE_TTL,
+        "command": command,
+    }
+
+
 # ---------------------------------------------------------------------------
 @router.get("/status")
 async def trainer_status():
-    return {"status": "ok", "version": "2.0.0"}
+    return {"status": "ok", "version": "3.0.0"}
 
 
 @router.post("/api/worker/heartbeat")
 async def legacy_heartbeat(request: Request):
-    """Trainer heartbeat — keep machine alive in KeyDB."""
     token = request.headers.get("Authorization", "").strip()
     machine_id = request.headers.get("X-Machine-Id", "").strip()
     if token and machine_id and settings.TRAINER_AUTH_TOKEN:
@@ -141,33 +155,34 @@ async def get_number(request: Request, count: int = 1):
     machine_id = _check_token(request)
     await _auto_register(request, machine_id)
 
-    # count=0 means registration-only (run-script ping): heartbeat without allocating X values
     if count == 0:
-        return {"numbers": [], "command": "ok"}
+        return _empty_response("ok")
 
     count = max(1, min(count, 1000))
 
-    # Fast path: verified machine, no test mode → 100% KeyDB, zero SQLite
+    # Fast path: verified machine, no test mode
     if _is_verified_cached(machine_id) and not await _is_test_mode_cached():
         cmd = await keydb.get_pending_command(machine_id)
         if cmd:
-            return {"numbers": [], "command": cmd}
-        numbers = await next_batch(count, machine_id)
-        return {"numbers": numbers, "command": "work" if numbers else "done"}
+            return _empty_response(cmd)
+        items = await next_batch(count, machine_id)
+        if not items:
+            inflight = await keydb.get_inflight_count()
+            return _empty_response("wait" if inflight > 0 else "done")
+        return _batch_response(items)
 
-    # Slow path: needs full DB checks
-    # Commands always via KeyDB (single source of truth)
+    # Slow path: DB checks for test mode / verification
     cmd = await keydb.get_pending_command(machine_id)
     if cmd:
-        return {"numbers": [], "command": cmd}
-    async with get_db() as db:
+        return _empty_response(cmd)
 
+    async with get_db() as db:
         if await is_test_mode(db):
             numbers = await get_test_next(db, count, machine_id)
             if not numbers:
                 st = await get_test_status(db)
-                return {"numbers": [], "command": "stop" if st["complete"] else "wait"}
-            return {"numbers": numbers, "command": "work"}
+                return _empty_response("stop" if st["complete"] else "wait")
+            return {"numbers": numbers, "leases": {}, "lease_ttl": 0, "command": "work"}
 
         if not await is_machine_verified(db, machine_id):
             seeds_csv = await get_setting(db, "test_seeds", "")
@@ -176,20 +191,24 @@ async def get_number(request: Request, count: int = 1):
                 await init_machine_verify(db, machine_id, seeds)
                 unfound = await get_machine_unfound_seeds(db, machine_id)
                 if unfound:
-                    return {"numbers": unfound, "command": "verify"}
+                    return {"numbers": unfound, "leases": {}, "lease_ttl": 0, "command": "verify"}
             await set_machine_verified(db, machine_id)
             logger.info("Machine %s verified", machine_id)
 
         _verified_cache.add(machine_id)
 
-    numbers = await next_batch(count, machine_id)
-    return {"numbers": numbers, "command": "work" if numbers else "done"}
+    items = await next_batch(count, machine_id)
+    if not items:
+        inflight = await keydb.get_inflight_count()
+        return _empty_response("wait" if inflight > 0 else "done")
+    return _batch_response(items)
 
 
 # ---------------------------------------------------------------------------
 class MarkDoneRequest(BaseModel):
     num: int | None = None
     nums: list[int] | None = None
+    leases: dict[str, str] | None = None
 
 
 @router.post("/mark_done")
@@ -201,11 +220,29 @@ async def mark_done(request: Request, body: MarkDoneRequest):
     if not nums:
         return {"ok": True, "count": 0}
 
-    # KeyDB: increment completed counter + remove active keys (batched)
-    await keydb.incr_completed(len(nums))
-    await keydb.mark_x_done_batch(nums)
+    if body.leases:
+        entries = []
+        for n in nums:
+            lid = body.leases.get(str(n))
+            if lid:
+                entries.append((n, lid, machine_id))
 
-    # SQLite only for test mode (rare)
+        acked, rejected, already_done = await keydb.lease_ack(entries)
+
+        if rejected > 0:
+            logger.warning("mark_done: %d rejected (invalid lease) from %s", rejected, machine_id)
+
+        # Test mode bookkeeping (rare path)
+        if acked > 0 and await _is_test_mode_cached():
+            async with get_db() as db:
+                for n in nums:
+                    await mark_test_done(db, n)
+
+        return {"ok": True, "success": True, "count": acked, "rejected": rejected, "already_done": already_done}
+
+    # Legacy path: trainer without lease support
+    await keydb.lease_ack_legacy(nums)
+
     if await _is_test_mode_cached():
         async with get_db() as db:
             for n in nums:
@@ -269,7 +306,9 @@ async def trainer_stats(request: Request):
         "start": kdb["start"],
         "completed": kdb["completed"],
         "found_keys": found,
-        "active_numbers": kdb["active_numbers"],
+        "inflight": kdb["inflight"],
+        "ready_queue": kdb["ready_queue"],
+        "requeued_total": kdb["requeued_total"],
         "machines_online": kdb["machines_online"],
     }
 

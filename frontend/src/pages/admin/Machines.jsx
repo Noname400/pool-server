@@ -166,10 +166,11 @@ export default function Machines() {
       );
     }
 
-    if (sortBy === 'problems') entries.sort((a, b) => b.score - a.score || b.gpus.length - a.gpus.length);
-    else if (sortBy === 'name') entries.sort((a, b) => a.hostname.localeCompare(b.hostname));
-    else if (sortBy === 'ip') entries.sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }));
-    else if (sortBy === 'gpus') entries.sort((a, b) => b.totalCards - a.totalCards);
+    const stable = (a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }) || a.hostname.localeCompare(b.hostname);
+    if (sortBy === 'problems') entries.sort((a, b) => b.score - a.score || b.totalCards - a.totalCards || stable(a, b));
+    else if (sortBy === 'name') entries.sort((a, b) => a.hostname.localeCompare(b.hostname) || stable(a, b));
+    else if (sortBy === 'ip') entries.sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }) || a.hostname.localeCompare(b.hostname));
+    else if (sortBy === 'gpus') entries.sort((a, b) => b.totalCards - a.totalCards || stable(a, b));
 
     return entries;
   }, [machines, filter, search, sortBy]);

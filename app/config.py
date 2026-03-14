@@ -34,9 +34,14 @@ class Settings(BaseSettings):
     DEBUG: bool = False
 
     TRAINER_AUTH_TOKEN: str = ""
+    EXPORT_TOKEN: str = ""
 
     MACHINE_ALIVE_TTL: int = 60
     ACTIVE_X_TTL: int = 300
+
+    LEASE_TTL: int = 60
+    REQUEUE_INTERVAL: int = 5
+    REQUEUE_BATCH: int = 500
 
     @property
     def db_path(self) -> str:

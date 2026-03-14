@@ -49,7 +49,9 @@ async def pool_stats(admin: dict = Depends(require_admin)):
         "start": kdb["start"],
         "completed": kdb["completed"],
         "found_keys": found,
-        "active_numbers": kdb["active_numbers"],
+        "inflight": kdb["inflight"],
+        "ready_queue": kdb["ready_queue"],
+        "requeued_total": kdb["requeued_total"],
         "machines_total": len(machines),
         "machines_online": len(alive),
     }
@@ -200,6 +202,7 @@ async def get_settings_endpoint(admin: dict = Depends(require_admin)):
     db_settings["completed_count"] = str(completed)
     token = settings.TRAINER_AUTH_TOKEN
     db_settings["trainer_auth_token"] = f"{token[:6]}***" if len(token) > 6 else "***"
+    db_settings["lease_ttl"] = str(settings.LEASE_TTL)
 
     return db_settings
 

@@ -1,8 +1,8 @@
 """
-app/background/tasks.py — Background loops (pool v2).
+app/background/tasks.py — Background loops (pool v3).
 
 With multiple Uvicorn workers, only the leader (elected via KeyDB SETNX)
-runs persist + telegram tasks. Leadership is re-checked every loop iteration.
+runs persist + telegram + requeue tasks.
 """
 import asyncio
 import logging
@@ -19,12 +19,10 @@ logger = logging.getLogger("pool_server.background")
 settings = get_settings()
 
 PERSIST_INTERVAL = 300
-LEADER_CHECK_INTERVAL = 10
 
 
 async def persist_keydb_state() -> None:
-    """Save KeyDB step + completed count to SQLite every PERSIST_INTERVAL seconds.
-    Only the leader worker actually writes; others just sleep and retry leadership."""
+    """Save KeyDB step + completed count to SQLite periodically."""
     while True:
         await asyncio.sleep(PERSIST_INTERVAL)
         try:
@@ -42,6 +40,33 @@ async def persist_keydb_state() -> None:
             break
         except Exception:
             logger.error("persist_keydb_state error:\n%s", traceback.format_exc())
+
+
+async def requeue_expired_leases() -> None:
+    """Move expired inflight X values back to the ready queue."""
+    interval = settings.REQUEUE_INTERVAL
+    batch = settings.REQUEUE_BATCH
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            is_leader = await keydb.try_become_leader()
+            if not is_leader:
+                continue
+            await keydb.renew_leadership()
+
+            total = 0
+            while True:
+                n = await keydb.lease_requeue(limit=batch)
+                total += n
+                if n < batch:
+                    break
+
+            if total > 0:
+                logger.info("Requeued %d expired leases", total)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.error("requeue_expired_leases error:\n%s", traceback.format_exc())
 
 
 async def telegram_stats_loop() -> None:
@@ -72,7 +97,9 @@ async def telegram_stats_loop() -> None:
                 f"Cluster stats\n\n"
                 f"Completed: {completed:,}\n"
                 f"Found keys: {found}\n"
-                f"Active: {kdb['active_numbers']}\n\n"
+                f"Inflight: {kdb['inflight']}\n"
+                f"Ready queue: {kdb['ready_queue']}\n"
+                f"Requeued total: {kdb['requeued_total']}\n\n"
                 f"Progress: {progress:.4f}%\n"
                 f"Step: {step:,}\n"
                 f"Remaining: {remaining:,}\n\n"

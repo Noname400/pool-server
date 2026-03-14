@@ -141,8 +141,10 @@ export default function Overview() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem', marginBottom: '2rem' }}>
         <StatCard label="Machines Online" value={stats.machines_online} color="#22c55e" />
         <StatCard label="Machines Total" value={stats.machines_total} />
-        <StatCard label="Active Numbers" value={stats.active_numbers} color="#f59e0b" />
+        <StatCard label="Inflight" value={(stats.inflight || 0).toLocaleString()} color="#f59e0b" />
+        <StatCard label="Ready Queue" value={(stats.ready_queue || 0).toLocaleString()} color="#3b82f6" />
         <StatCard label="Completed" value={(stats.completed || 0).toLocaleString()} />
+        <StatCard label="Requeued" value={(stats.requeued_total || 0).toLocaleString()} color="#f97316" />
         <StatCard label="Found Keys" value={stats.found_keys} color="#8b5cf6" />
         <StatCard label="Progress" value={`${progress.toFixed(4)}%`} />
       </div>
