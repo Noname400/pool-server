@@ -31,9 +31,11 @@ COPY app/ ./app/
 
 COPY --from=frontend-builder /frontend/dist ./frontend/dist
 
+ENV WEB_CONCURRENCY=4
+
 EXPOSE 8421
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8421/status || exit 1
 
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8421", "--workers", "4"]
+CMD python -m uvicorn app.main:app --host 0.0.0.0 --port 8421 --workers ${WEB_CONCURRENCY}
