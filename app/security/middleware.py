@@ -19,7 +19,7 @@ def setup_cors(app: FastAPI) -> None:
     allowed_origins = [o.strip() for o in raw.split(",") if o.strip()] if raw else []
     if not allowed_origins:
         logger.warning("CORS_ORIGINS is empty — all cross-origin requests will be blocked. "
-                       "Set CORS_ORIGINS in .env (e.g. https://training.bbdata.net)")
+                       "Set CORS_ORIGINS in .env (e.g. https://bbdata.net)")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
