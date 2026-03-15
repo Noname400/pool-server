@@ -7,6 +7,12 @@ Lease-based X distribution (pool v3):
   pool:lease:{x}  (STRING)          — "machine_id:lease_id" with TTL safety-net
   pool:lease_seq  (counter)         — auto-increment lease ID
 
+Invariants:
+  - An X can only be in ONE of {ready, inflight} at any time.
+  - mark_done without a valid lease_id NEVER increments completed:count.
+  - requeue only moves items whose inflight score (expire_ts) <= now.
+  - completed + |inflight| + |ready| accounts for all issued X (modulo requeue cycles).
+
 Machine liveness, pending commands, leader election unchanged from v2.
 """
 import logging
@@ -132,7 +138,73 @@ async def get_alive_machines() -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Lease-based X allocation (replaces old active:* TTL tracking)
+# Combined hot-path: touch + command check + lease allocate (single Lua)
+# ---------------------------------------------------------------------------
+_LUA_HOT_PATH = """
+local machine_id = ARGV[1]
+local alive_ttl = tonumber(ARGV[2])
+local count = tonumber(ARGV[3])
+local expire_ts = tonumber(ARGV[4])
+local key_ttl = tonumber(ARGV[5])
+
+-- 1. Touch alive
+redis.call('SET', 'alive:' .. machine_id, '1', 'EX', alive_ttl)
+
+-- 2. Check pending command (atomic getdel)
+local cmd = redis.call('GETDEL', 'cmd:' .. machine_id)
+if cmd then
+    return {'CMD', cmd}
+end
+
+-- 3. Allocate leases
+if count <= 0 then
+    return {'OK'}
+end
+
+local items = redis.call('ZPOPMIN', KEYS[1], count)
+local result = {'BATCH'}
+
+for i = 1, #items, 2 do
+    local x = items[i]
+    local lid = redis.call('INCR', KEYS[3])
+    redis.call('ZADD', KEYS[2], expire_ts, x)
+    redis.call('SET', 'pool:lease:' .. x, machine_id .. ':' .. lid, 'EX', key_ttl)
+    result[#result + 1] = x
+    result[#result + 1] = tostring(lid)
+end
+
+return result
+"""
+
+
+async def hot_path_allocate(
+    machine_id: str, alive_ttl: int, count: int, expire_ts: float, key_ttl: int
+) -> tuple[str, list[dict] | str]:
+    """Single round-trip: touch alive, check command, allocate leases.
+
+    Returns:
+        ("CMD", command_str)  — pending command found, no allocation
+        ("OK", [])            — count=0, just heartbeat
+        ("BATCH", items)      — items = [{"x": int, "lease_id": str}, ...]
+    """
+    script = await _get_script("hot_path", _LUA_HOT_PATH)
+    result = await script(
+        keys=["pool:ready", "pool:inflight", "pool:lease_seq"],
+        args=[machine_id, alive_ttl, count, expire_ts, key_ttl],
+    )
+    tag = result[0]
+    if tag == "CMD":
+        return "CMD", result[1]
+    if tag == "OK":
+        return "OK", []
+    items = []
+    for i in range(1, len(result), 2):
+        items.append({"x": int(result[i]), "lease_id": str(result[i + 1])})
+    return "BATCH", items
+
+
+# ---------------------------------------------------------------------------
+# Lease-based X allocation (standalone, used by slow path / test mode)
 # ---------------------------------------------------------------------------
 
 _LUA_ALLOCATE = """
@@ -259,20 +331,6 @@ async def lease_ack(entries: list[tuple[int, str, str]]) -> tuple[int, int, int]
     return int(result[0]), int(result[1]), int(result[2])
 
 
-async def lease_ack_legacy(nums: list[int]) -> int:
-    """Legacy ack without lease validation (backward compat with old trainers)."""
-    if not nums:
-        return 0
-    r = get_keydb()
-    pipe = r.pipeline()
-    for n in nums:
-        pipe.zrem("pool:inflight", str(n))
-        pipe.delete(f"pool:lease:{n}")
-    await pipe.execute()
-    await r.incrby("completed:count", len(nums))
-    return len(nums)
-
-
 async def lease_requeue(limit: int = 500) -> int:
     """Move expired inflight items back to ready queue. Returns count requeued."""
     script = await _get_script("requeue", _LUA_REQUEUE)
@@ -304,13 +362,8 @@ async def get_inflight_count() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Completed counter (atomic) — also incremented by lease_ack Lua
+# Completed counter — incremented atomically by lease_ack Lua script
 # ---------------------------------------------------------------------------
-async def incr_completed(count: int = 1) -> int:
-    r = get_keydb()
-    return await r.incrby("completed:count", count)
-
-
 async def get_completed_count() -> int:
     r = get_keydb()
     val = await r.get("completed:count")
@@ -372,18 +425,38 @@ async def renew_leadership() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Stats helpers
+# Stats helpers (cached to reduce Redis round-trips on dashboard polls)
 # ---------------------------------------------------------------------------
+_stats_cache: dict | None = None
+_stats_cache_ts: float = 0
+_STATS_CACHE_TTL = 2
+
+
 async def get_pool_stats() -> dict:
+    global _stats_cache, _stats_cache_ts
+    now = time.monotonic()
+    if _stats_cache and now - _stats_cache_ts < _STATS_CACHE_TTL:
+        return _stats_cache
+
     r = get_keydb()
-    step = int(await r.get("partx:step") or 0)
-    start = int(await r.get("partx:start") or 0)
-    completed = int(await r.get("completed:count") or 0)
+    pipe = r.pipeline()
+    pipe.get("partx:step")
+    pipe.get("partx:start")
+    pipe.get("completed:count")
+    pipe.zcard("pool:inflight")
+    pipe.zcard("pool:ready")
+    pipe.get("pool:stats:requeued")
+    results = await pipe.execute()
+
+    step = int(results[0] or 0)
+    start = int(results[1] or 0)
+    completed = int(results[2] or 0)
+    inflight = int(results[3] or 0)
+    ready = int(results[4] or 0)
+    requeued_total = int(results[5] or 0)
     alive = await get_alive_machines()
-    inflight = await get_inflight_count()
-    ready = await get_ready_count()
-    requeued_total = int(await r.get("pool:stats:requeued") or 0)
-    return {
+
+    _stats_cache = {
         "step": step,
         "start": start,
         "completed": completed,
@@ -391,4 +464,16 @@ async def get_pool_stats() -> dict:
         "inflight": inflight,
         "ready_queue": ready,
         "requeued_total": requeued_total,
+        "ts": time.time(),
     }
+    _stats_cache_ts = now
+    return _stats_cache
+
+
+async def is_keydb_healthy() -> bool:
+    """Quick health probe for readiness checks."""
+    try:
+        r = get_keydb()
+        return await r.ping()
+    except Exception:
+        return False

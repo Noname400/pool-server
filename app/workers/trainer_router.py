@@ -1,9 +1,11 @@
 """
 app/workers/trainer_router.py — Trainer-facing API (pool v3, lease-based).
 
-Direct HTTPS, implicit heartbeat, auto-registration.
-SQLite writes throttled: machine info updated at most once per _DB_WRITE_INTERVAL.
+Hot path (get_number / mark_done) touches ONLY KeyDB via combined Lua scripts.
+SQLite is hit only for rare events: new machine registration, set_found,
+machine verification milestones, and test_mode flow.
 """
+import asyncio
 import hmac
 import logging
 import time
@@ -33,7 +35,6 @@ from app.db.sqlite import (
     set_machine_verified,
     upsert_machine,
 )
-from app.workers.partx_generator import next_batch
 
 router = APIRouter(tags=["trainer"])
 logger = logging.getLogger("pool_server.trainer")
@@ -47,6 +48,7 @@ _verified_cache: set[str] = set()
 _test_mode_cache: bool | None = None
 _test_mode_ts: float = 0
 _TEST_MODE_CACHE_TTL = 5
+_test_mode_lock: asyncio.Lock | None = None
 
 
 def _check_token(request: Request) -> str:
@@ -69,10 +71,20 @@ def _real_ip(request: Request) -> str:
     ).strip()
 
 
-async def _auto_register(request: Request, machine_id: str):
-    """Touch KeyDB always; write SQLite only every _DB_WRITE_INTERVAL seconds."""
-    await keydb.touch_machine(machine_id, ttl=settings.MACHINE_ALIVE_TTL)
+def _safe_int_header(request: Request, name: str, default: int = 0) -> int:
+    raw = request.headers.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return default
 
+
+async def _auto_register(request: Request, machine_id: str):
+    """Write SQLite only every _DB_WRITE_INTERVAL seconds.
+    KeyDB alive touch is done inside the hot-path Lua script, not here.
+    """
     now = time.monotonic()
     last = _machine_last_db_write.get(machine_id, 0)
     if now - last < _DB_WRITE_INTERVAL:
@@ -81,8 +93,8 @@ async def _auto_register(request: Request, machine_id: str):
     hostname = request.headers.get("X-Hostname", "").strip() or machine_id
     ip = _real_ip(request)
     gpu_name = request.headers.get("X-GPU-Name", "").strip() or None
-    gpu_count = int(request.headers.get("X-GPU-Count", "0") or 0)
-    gpu_mem = int(request.headers.get("X-GPU-Mem", "0") or 0) or None
+    gpu_count = _safe_int_header(request, "X-GPU-Count", 0)
+    gpu_mem = _safe_int_header(request, "X-GPU-Mem", 0) or None
     version = request.headers.get("X-Version", "").strip() or None
 
     async with get_db() as db:
@@ -104,14 +116,19 @@ def evict_machine_cache(machine_id: str) -> None:
 
 
 async def _is_test_mode_cached() -> bool:
-    global _test_mode_cache, _test_mode_ts
+    global _test_mode_cache, _test_mode_ts, _test_mode_lock
     now = time.monotonic()
     if _test_mode_cache is not None and now - _test_mode_ts < _TEST_MODE_CACHE_TTL:
         return _test_mode_cache
-    async with get_db() as db:
-        _test_mode_cache = await is_test_mode(db)
-    _test_mode_ts = now
-    return _test_mode_cache
+    if _test_mode_lock is None:
+        _test_mode_lock = asyncio.Lock()
+    async with _test_mode_lock:
+        if _test_mode_cache is not None and now - _test_mode_ts < _TEST_MODE_CACHE_TTL:
+            return _test_mode_cache
+        async with get_db() as db:
+            _test_mode_cache = await is_test_mode(db)
+        _test_mode_ts = time.monotonic()
+        return _test_mode_cache
 
 
 def _is_verified_cached(machine_id: str) -> bool:
@@ -153,25 +170,39 @@ async def legacy_heartbeat(request: Request):
 @router.get("/get_number")
 async def get_number(request: Request, count: int = 1):
     machine_id = _check_token(request)
-    await _auto_register(request, machine_id)
+
+    count = max(0, min(count, 1000))
 
     if count == 0:
+        await keydb.touch_machine(machine_id, ttl=settings.MACHINE_ALIVE_TTL)
+        await _auto_register(request, machine_id)
         return _empty_response("ok")
 
-    count = max(1, min(count, 1000))
-
-    # Fast path: verified machine, no test mode
+    # Fast path: verified machine, no test mode — single Lua round-trip
     if _is_verified_cached(machine_id) and not await _is_test_mode_cached():
-        cmd = await keydb.get_pending_command(machine_id)
-        if cmd:
-            return _empty_response(cmd)
-        items = await next_batch(count, machine_id)
-        if not items:
+        now = time.time()
+        ttl = settings.LEASE_TTL
+        tag, payload = await keydb.hot_path_allocate(
+            machine_id=machine_id,
+            alive_ttl=settings.MACHINE_ALIVE_TTL,
+            count=count,
+            expire_ts=now + ttl,
+            key_ttl=ttl * 3,
+        )
+        # SQLite registration throttled in background
+        await _auto_register(request, machine_id)
+
+        if tag == "CMD":
+            return _empty_response(payload)
+        if not payload:
             inflight = await keydb.get_inflight_count()
             return _empty_response("wait" if inflight > 0 else "done")
-        return _batch_response(items)
+        return _batch_response(payload)
 
     # Slow path: DB checks for test mode / verification
+    await keydb.touch_machine(machine_id, ttl=settings.MACHINE_ALIVE_TTL)
+    await _auto_register(request, machine_id)
+
     cmd = await keydb.get_pending_command(machine_id)
     if cmd:
         return _empty_response(cmd)
@@ -197,7 +228,9 @@ async def get_number(request: Request, count: int = 1):
 
         _verified_cache.add(machine_id)
 
-    items = await next_batch(count, machine_id)
+    now = time.time()
+    ttl = settings.LEASE_TTL
+    items = await keydb.lease_allocate(count, machine_id, now + ttl, ttl * 3)
     if not items:
         inflight = await keydb.get_inflight_count()
         return _empty_response("wait" if inflight > 0 else "done")
@@ -214,41 +247,37 @@ class MarkDoneRequest(BaseModel):
 @router.post("/mark_done")
 async def mark_done(request: Request, body: MarkDoneRequest):
     machine_id = _check_token(request)
+    await keydb.touch_machine(machine_id, ttl=settings.MACHINE_ALIVE_TTL)
     await _auto_register(request, machine_id)
 
     nums = body.nums or ([body.num] if body.num is not None else [])
     if not nums:
         return {"ok": True, "count": 0}
 
-    if body.leases:
-        entries = []
-        for n in nums:
-            lid = body.leases.get(str(n))
-            if lid:
-                entries.append((n, lid, machine_id))
+    if not body.leases:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="leases dict is required (v3 protocol). "
+            "Send the leases from get_number response.",
+        )
 
-        acked, rejected, already_done = await keydb.lease_ack(entries)
+    entries = []
+    for n in nums:
+        lid = body.leases.get(str(n))
+        if lid:
+            entries.append((n, lid, machine_id))
 
-        if rejected > 0:
-            logger.warning("mark_done: %d rejected (invalid lease) from %s", rejected, machine_id)
+    acked, rejected, already_done = await keydb.lease_ack(entries)
 
-        # Test mode bookkeeping (rare path)
-        if acked > 0 and await _is_test_mode_cached():
-            async with get_db() as db:
-                for n in nums:
-                    await mark_test_done(db, n)
+    if rejected > 0:
+        logger.warning("mark_done: %d rejected (invalid lease) from %s", rejected, machine_id)
 
-        return {"ok": True, "success": True, "count": acked, "rejected": rejected, "already_done": already_done}
-
-    # Legacy path: trainer without lease support
-    await keydb.lease_ack_legacy(nums)
-
-    if await _is_test_mode_cached():
+    if acked > 0 and await _is_test_mode_cached():
         async with get_db() as db:
             for n in nums:
                 await mark_test_done(db, n)
 
-    return {"ok": True, "success": True, "count": len(nums)}
+    return {"ok": True, "success": True, "count": acked, "rejected": rejected, "already_done": already_done}
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +290,7 @@ class SetFoundRequest(BaseModel):
 @router.post("/overfitted")
 async def set_found(request: Request, body: SetFoundRequest):
     machine_id = _check_token(request)
+    await keydb.touch_machine(machine_id, ttl=settings.MACHINE_ALIVE_TTL)
     await _auto_register(request, machine_id)
 
     y_str = str(body.y)[:8192]
@@ -274,7 +304,7 @@ async def set_found(request: Request, body: SetFoundRequest):
         else:
             x_int = int(x_raw)
     except (ValueError, AttributeError):
-        x_int = 0
+        raise HTTPException(status_code=400, detail="Invalid X value")
 
     if x_int < 0 or x_int > 2**32 - 1:
         raise HTTPException(status_code=400, detail="X value out of range")

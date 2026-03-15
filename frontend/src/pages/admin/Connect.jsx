@@ -118,7 +118,7 @@ X-Version: <trainer-version>`;
 
       <div style={{ background: '#ef444415', border: '1px solid #ef444440', padding: '1rem', borderRadius: '0.75rem', marginTop: '0.75rem' }}>
         <strong style={{ color: '#ef4444' }}>Important:</strong> Always send the <code>leases</code> dict from <code>get_number</code> response back in <code>mark_done</code>.
-        Without it, lease validation is skipped (legacy mode) and re-queue protection does not apply.
+        The <code>leases</code> field is required — requests without it will be rejected with 400.
       </div>
     </div>
   );

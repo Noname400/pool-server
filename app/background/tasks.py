@@ -2,7 +2,7 @@
 app/background/tasks.py — Background loops (pool v3).
 
 With multiple Uvicorn workers, only the leader (elected via KeyDB SETNX)
-runs persist + telegram + requeue tasks.
+runs persist + telegram + requeue + refill tasks.
 """
 import asyncio
 import logging
@@ -13,7 +13,7 @@ from app.cache import keydb
 from app.config import get_settings
 from app.db.sqlite import count_found_keys, get_db, list_machines, set_setting
 from app.notifications.telegram import send_notification
-from app.workers.partx_generator import MAX_X
+from app.workers.partx_generator import MAX_X, is_space_exhausted, refill_ready_queue
 
 logger = logging.getLogger("pool_server.background")
 settings = get_settings()
@@ -67,6 +67,49 @@ async def requeue_expired_leases() -> None:
             break
         except Exception:
             logger.error("requeue_expired_leases error:\n%s", traceback.format_exc())
+
+
+async def ready_queue_filler() -> None:
+    """Keep pool:ready above READY_LOW_WATERMARK by generating new X ranges.
+
+    Only the leader runs this. Checks every REFILL_INTERVAL seconds.
+    """
+    interval = settings.REFILL_INTERVAL
+    low_wm = settings.READY_LOW_WATERMARK
+    target = settings.READY_TARGET
+    batch = settings.REFILL_BATCH
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            is_leader = await keydb.try_become_leader()
+            if not is_leader:
+                continue
+            await keydb.renew_leadership()
+
+            if await is_space_exhausted():
+                continue
+
+            ready = await keydb.get_ready_count()
+            if ready >= low_wm:
+                continue
+
+            need = target - ready
+            filled = 0
+            while need > 0 and not await is_space_exhausted():
+                chunk = min(need, batch)
+                added = await refill_ready_queue(batch=chunk)
+                filled += added
+                need -= added
+                if added < chunk:
+                    break
+
+            if filled > 0:
+                logger.info("Refilled pool:ready with %d items (now ~%d)", filled, ready + filled)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.error("ready_queue_filler error:\n%s", traceback.format_exc())
 
 
 async def telegram_stats_loop() -> None:

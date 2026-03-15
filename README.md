@@ -9,10 +9,10 @@ FastAPI + React SPA + SQLite + KeyDB. Один Docker-контейнер. Nginx 
 Trainer (GPU)                     Pool Server
   │                                 │
   │  HTTPS (Cloudflare → Nginx)     │
-  ├─ GET  /get_number?count=N ─────►│──► KeyDB: ZPOPMIN pool:ready
+  ├─ GET  /get_number?count=N ─────►│──► KeyDB Lua: touch + cmd check + ZPOPMIN
   │◄─ {"numbers":[...],             │      ZADD pool:inflight (score=expire_ts)
   │    "leases":{x:lid},            │      SET pool:lease:{x} (machine:lid, TTL)
-  │    "lease_ttl":60,              │      touch alive:{id}
+  │    "lease_ttl":60,              │
   │    "command":"work"}            │
   │                                 │
   ├─ POST /mark_done ──────────────►│──► Lua ACK: validate lease_id
@@ -25,8 +25,11 @@ Trainer (GPU)                     Pool Server
   │                                 │
   └─────────────────────────────────┘
 
-Background: requeue_expired_leases (every 5s)
-  └─ ZRANGEBYSCORE pool:inflight(-inf, now) → ZADD pool:ready
+Background loops (leader-only):
+  ready_queue_filler  (every 1s)   — keeps pool:ready above READY_LOW_WATERMARK
+  requeue_expired     (every 5s)   — returns expired inflight → pool:ready
+  persist_keydb_state (every 300s) — saves step/completed to SQLite
+  telegram_stats      (configurable)
 
 Admin UI (React SPA)
   ├─ /admin              Overview: step, completed, inflight, ready, requeued, found
@@ -44,6 +47,22 @@ Admin UI (React SPA)
 2. **Нет двойного зачёта**: `mark_done` валидирует `lease_id`; поздний ack после reassign отклоняется.
 3. **Идемпотентность**: повторный `mark_done` для уже подтверждённого X — безопасный no-op.
 4. **O(log N)**: все операции через ZSET и Lua-скрипты, без полных сканирований.
+5. **Strict mode**: `mark_done` без `leases` отклоняется с 400 (legacy mode удален).
+
+### Инварианты
+
+- X может быть только в одном из {`pool:ready`, `pool:inflight`} в любой момент.
+- `mark_done` без валидного `lease_id` НЕ увеличивает `completed:count`.
+- `requeue` возвращает только элементы с `expire_ts <= now`.
+- `completed + |inflight| + |ready|` учитывает все выданные X (с поправкой на requeue).
+- Все trainer-запросы идемпотентны или безопасно повторяемы.
+
+### Hot path (single Lua round-trip)
+
+`GET /get_number` для verified машин выполняет один Lua-скрипт:
+1. `SET alive:{machine} 1 EX ttl` — touch liveness
+2. `GETDEL cmd:{machine}` — check pending command
+3. `ZPOPMIN pool:ready` + `ZADD pool:inflight` + `SET pool:lease:{x}` — allocate with leases
 
 ### KeyDB структуры
 
@@ -74,38 +93,13 @@ Admin UI (React SPA)
 | Метод | Путь | Auth | Описание |
 |-------|------|------|----------|
 | GET | `/status` | — | Health check |
-| GET | `/get_number?count=N` | Token + X-Machine-Id | Запрос X с lease (max 1000), count=0 — регистрация |
-| POST | `/mark_done` | Token + X-Machine-Id | Подтверждение X с lease_id |
+| GET | `/health` | — | Deep health (KeyDB + ready queue depth) |
+| GET | `/get_number?count=N` | Token + X-Machine-Id | Запрос X с lease (max 1000), count=0 — heartbeat |
+| POST | `/mark_done` | Token + X-Machine-Id | Подтверждение X с lease_id (**обязательно**) |
 | POST | `/set_found` | Token + X-Machine-Id | Сообщение о находке (x, y) |
 | GET | `/stats` | Token | Статистика |
 | GET | `/machines` | Token | Список машин |
 | GET | `/found_keys` | Token | Найденные ключи |
-
-**GET /get_number response:**
-
-```json
-{
-  "numbers": [100, 101, 102],
-  "leases": {"100": "42", "101": "43", "102": "44"},
-  "lease_ttl": 60,
-  "command": "work"
-}
-```
-
-**POST /mark_done request:**
-
-```json
-{
-  "nums": [100, 101, 102],
-  "leases": {"100": "42", "101": "43", "102": "44"}
-}
-```
-
-**POST /mark_done response:**
-
-```json
-{"ok": true, "count": 3, "rejected": 0, "already_done": 0}
-```
 
 **Headers трейнера:**
 
@@ -123,7 +117,7 @@ X-Version: <version>
 
 | Метод | Путь | Описание |
 |-------|------|----------|
-| GET | `/stats` | Общая статистика (включая inflight, ready, requeued) |
+| GET | `/stats` | Общая статистика с timestamp |
 | GET | `/machines` | Список машин |
 | GET | `/machines/{id}` | Детали машины |
 | PATCH | `/machines/{id}` | Обновить name/tags |
@@ -151,8 +145,9 @@ X-Version: <version>
 |-----------|---------|----------|
 | `DATA_DIR` | `/data` | Путь к SQLite (pool.db) |
 | `KEYDB_URL` | `redis://127.0.0.1:6379/0` | KeyDB/Redis URL |
-| `SECRET_KEY` | auto | JWT signing key |
+| `SECRET_KEY` | — | JWT signing key (**обязательно для production**) |
 | `TRAINER_AUTH_TOKEN` | — | Токен трейнеров (**обязательно**) |
+| `EXPORT_TOKEN` | — | Токен для /export/ (отдельный от trainer) |
 | `CORS_ORIGINS` | — | Allowed origins (через запятую) |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram Bot API |
 | `TELEGRAM_CHAT_ID` | — | Telegram chat ID |
@@ -161,6 +156,10 @@ X-Version: <version>
 | `LEASE_TTL` | `60` | Время аренды X (сек). По истечении — requeue |
 | `REQUEUE_INTERVAL` | `5` | Интервал проверки просроченных leases (сек) |
 | `REQUEUE_BATCH` | `500` | Max leases per requeue iteration |
+| `READY_LOW_WATERMARK` | `10000` | Порог, ниже которого начинается refill |
+| `READY_TARGET` | `50000` | Целевой размер pool:ready при refill |
+| `REFILL_INTERVAL` | `1.0` | Интервал проверки watermark (сек) |
+| `REFILL_BATCH` | `5000` | Max X per refill iteration |
 | `HOST` | `0.0.0.0` | Bind host |
 | `PORT` | `8421` | Bind port |
 | `DEBUG` | `false` | Debug mode |
@@ -169,8 +168,9 @@ X-Version: <version>
 
 | Задача | Интервал | Действие |
 |--------|----------|----------|
-| `persist_keydb_state` | 300 сек | Сохраняет step, completed в SQLite |
+| `ready_queue_filler` | 1 сек | Держит pool:ready выше READY_LOW_WATERMARK |
 | `requeue_expired_leases` | 5 сек | Возвращает просроченные X из inflight в ready |
+| `persist_keydb_state` | 300 сек | Сохраняет step, completed в SQLite |
 | `telegram_stats_loop` | настраиваемый | Статистика в Telegram |
 
 ## Docker
@@ -187,16 +187,33 @@ docker run -d \
   bbdata/pool-server:latest
 ```
 
+## Тестирование
+
+```bash
+# Unit / integration tests (requires running KeyDB on localhost:6379)
+pip install pytest pytest-asyncio
+pytest tests/ -v
+
+# Load test
+python tests/load_test.py \
+  --url http://localhost:8421 \
+  --token $TRAINER_AUTH_TOKEN \
+  --machines 500 \
+  --duration 60
+```
+
 ## Безопасность
 
 | Уровень | Защита |
 |---------|--------|
 | Cloudflare | WAF, DDoS, TLS |
-| Nginx | Origin cert, rate limit, security headers |
+| Nginx | Origin cert, rate limit (100r/s per IP burst 200), security headers |
+| SPA | Path traversal protection (resolved path check) |
 | CORS | Whitelist origins |
-| Trainer | TRAINER_AUTH_TOKEN (hmac) |
+| Trainer | TRAINER_AUTH_TOKEN (hmac.compare_digest) |
 | Admin | JWT cookie (HttpOnly, SameSite=Strict, Secure) |
 | API keys | bcrypt (legacy SHA-256) |
+| Config | SECRET_KEY обязателен для multi-worker |
 
 ## Первый запуск
 
@@ -204,4 +221,4 @@ docker run -d \
 2. `init_keydb()` — подключение к KeyDB
 3. `_restore_keydb_state()` — step/completed из SQLite при пустом KeyDB
 4. Если нет admin — создаётся admin + API key в лог
-5. Background tasks (persist + requeue + telegram) + Uvicorn :8421
+5. Background tasks (refill + requeue + persist + telegram) + Uvicorn :8421

@@ -35,8 +35,11 @@ check_http() {
     local name="$1"
     local url="$2"
 
-    if curl -sf --max-time 5 "$url" >/dev/null 2>&1; then
+    local body
+    body=$(curl -sf --max-time 5 "$url" 2>/dev/null) || body=""
+    if [[ -n "$body" ]]; then
         echo -e "  ${GREEN}[OK]${NC}  $name — $url"
+        echo "         $body" | head -1
     else
         echo -e "  ${RED}[DOWN]${NC}  $name — $url (not responding)"
         HEALTHY=false
@@ -49,22 +52,17 @@ echo "=========================="
 echo ""
 
 echo "Containers:"
-check_service "Pool Server" "pool-server"
+check_service "Pool Server" "pool-app"
 echo ""
 
 echo "HTTP Endpoints:"
-check_http "App (direct)" "http://localhost:8421/status"
-check_http "Nginx (HTTP)" "http://localhost:80/"
+check_http "Deep health" "http://localhost:8421/health"
+check_http "Basic status" "http://localhost:8421/status"
 echo ""
 
 echo "Resource Usage:"
 docker stats --no-stream --format "  {{.Name}}: CPU {{.CPUPerc}} | MEM {{.MemUsage}}" \
-    pool-server 2>/dev/null || true
-echo ""
-
-echo "Disk:"
-echo "  Volumes:"
-docker system df -v 2>/dev/null | grep -E "pool" | head -5 || true
+    pool-app 2>/dev/null || echo "  (container not running)"
 echo ""
 
 if $HEALTHY; then

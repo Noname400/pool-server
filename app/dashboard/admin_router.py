@@ -3,6 +3,7 @@ app/dashboard/admin_router.py — Admin API (SQLite + KeyDB).
 """
 import json
 import logging
+import time
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -33,7 +34,7 @@ settings = get_settings()
 
 
 # ---------------------------------------------------------------------------
-# Stats
+# Stats (consistent snapshot with timestamp)
 # ---------------------------------------------------------------------------
 @router.get("/stats")
 async def pool_stats(admin: dict = Depends(require_admin)):
@@ -54,6 +55,7 @@ async def pool_stats(admin: dict = Depends(require_admin)):
         "requeued_total": kdb["requeued_total"],
         "machines_total": len(machines),
         "machines_online": len(alive),
+        "ts": kdb.get("ts", time.time()),
     }
 
 
