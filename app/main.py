@@ -18,6 +18,7 @@ from app.background.tasks import (
     persist_keydb_state,
     ready_queue_filler,
     requeue_expired_leases,
+    stats_collector,
     telegram_stats_loop,
 )
 from app.cache import keydb
@@ -81,6 +82,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(persist_keydb_state()),
         asyncio.create_task(requeue_expired_leases()),
         asyncio.create_task(ready_queue_filler()),
+        asyncio.create_task(stats_collector()),
         asyncio.create_task(telegram_stats_loop()),
     ]
 

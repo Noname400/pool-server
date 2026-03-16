@@ -62,6 +62,12 @@ export function updateSettings(data) { return post('/admin/settings', { settings
 // Admin: Found Keys
 export function getFoundKeys(limit = 200) { return get(`/admin/found-keys?limit=${limit}`); }
 
+// Admin: Stats History
+export function getStatsHistory(hours = 24) { return get(`/admin/stats/history?hours=${hours}`); }
+
+// Admin: Gate Monitor
+export function getGateStats() { return get('/admin/gate-stats'); }
+
 // Admin: Test Stand
 export function getTestStatus() { return get('/admin/test/status'); }
 export function startTest(xValues) { return post('/admin/test/start', { x_values: xValues }); }

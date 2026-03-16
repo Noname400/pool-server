@@ -8,6 +8,8 @@ import Machines from './pages/admin/Machines';
 import FoundKeys from './pages/admin/FoundKeys';
 import Connect from './pages/admin/Connect';
 import AdminSettings from './pages/admin/Settings';
+import Analytics from './pages/admin/Analytics';
+import GateMonitor from './pages/admin/GateMonitor';
 import LoadingSpinner from './components/LoadingSpinner';
 
 function ProtectedRoute({ children }) {
@@ -42,6 +44,8 @@ export default function App() {
         <Route path="machines" element={<Machines />} />
         <Route path="found-keys" element={<FoundKeys />} />
         <Route path="connect" element={<Connect />} />
+        <Route path="analytics" element={<Analytics />} />
+        <Route path="gate" element={<GateMonitor />} />
         <Route path="settings" element={<AdminSettings />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

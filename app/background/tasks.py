@@ -11,7 +11,10 @@ from datetime import datetime, timezone
 
 from app.cache import keydb
 from app.config import get_settings
-from app.db.sqlite import count_found_keys, get_db, list_machines, set_setting
+from app.db.sqlite import (
+    cleanup_stats_history, count_found_keys, get_db, get_setting,
+    insert_stats_snapshot, list_machines, set_setting,
+)
 from app.notifications.telegram import send_notification
 from app.workers.partx_generator import MAX_X, is_space_exhausted, refill_ready_queue
 
@@ -110,6 +113,58 @@ async def ready_queue_filler() -> None:
             break
         except Exception:
             logger.error("ready_queue_filler error:\n%s", traceback.format_exc())
+
+
+STATS_COLLECT_INTERVAL = 60
+STATS_CLEANUP_EVERY = 300
+_stats_cleanup_counter = 0
+
+
+async def stats_collector() -> None:
+    """Record pool snapshots to SQLite every 60s when stats_debug is enabled."""
+    global _stats_cleanup_counter
+    while True:
+        await asyncio.sleep(STATS_COLLECT_INTERVAL)
+        try:
+            is_leader = await keydb.try_become_leader()
+            if not is_leader:
+                continue
+            await keydb.renew_leadership()
+
+            async with get_db() as db:
+                enabled = await get_setting(db, "stats_debug", "0")
+            if enabled != "1":
+                continue
+
+            kdb = await keydb.get_pool_stats()
+            async with get_db() as db:
+                found = await count_found_keys(db)
+                machines = await list_machines(db)
+                alive = await keydb.get_alive_machines()
+
+                await insert_stats_snapshot(
+                    db,
+                    completed=kdb["completed"],
+                    inflight=kdb["inflight"],
+                    ready_queue=kdb["ready_queue"],
+                    requeued_total=kdb["requeued_total"],
+                    found_keys=found,
+                    machines_online=len(alive),
+                    machines_total=len(machines),
+                    step=kdb["step"],
+                )
+
+                _stats_cleanup_counter += 1
+                if _stats_cleanup_counter >= STATS_CLEANUP_EVERY // STATS_COLLECT_INTERVAL:
+                    deleted = await cleanup_stats_history(db, keep_hours=24)
+                    if deleted > 0:
+                        logger.info("Stats history cleanup: removed %d old records", deleted)
+                    _stats_cleanup_counter = 0
+
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.error("stats_collector error:\n%s", traceback.format_exc())
 
 
 async def telegram_stats_loop() -> None:

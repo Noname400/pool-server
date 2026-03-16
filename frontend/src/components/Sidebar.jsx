@@ -6,6 +6,8 @@ const adminLinks = [
   { to: '/admin', label: 'Overview', icon: '\u2302', end: true },
   { to: '/admin/machines', label: 'Machines', icon: '\u2699' },
   { to: '/admin/found-keys', label: 'Found Keys', icon: '\u{1F511}' },
+  { to: '/admin/analytics', label: 'Analytics', icon: '\u{1F4CA}' },
+  { to: '/admin/gate', label: 'Gate', icon: '\u{1F6E1}' },
   { to: '/admin/connect', label: 'Connect', icon: '\u2795' },
   { to: '/admin/settings', label: 'Settings', icon: '\u2699' },
 ];
@@ -23,7 +25,7 @@ export default function Sidebar({ variant = 'admin' }) {
     <aside className="sidebar">
       <div className="sidebar-logo">
         <div className="sidebar-logo-icon">{'\u26A1'}</div>
-        <div className="sidebar-logo-text">GPU Pool v2</div>
+        <div className="sidebar-logo-text">GPU Pool v3</div>
       </div>
 
       <nav className="sidebar-nav">

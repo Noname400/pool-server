@@ -18,6 +18,8 @@ from app.db.sqlite import (
     get_all_settings,
     get_db,
     get_machine,
+    get_setting,
+    get_stats_history,
     get_test_status,
     insert_test_items,
     is_test_mode,
@@ -57,6 +59,18 @@ async def pool_stats(admin: dict = Depends(require_admin)):
         "machines_online": len(alive),
         "ts": kdb.get("ts", time.time()),
     }
+
+
+# ---------------------------------------------------------------------------
+# Stats History (debug analytics)
+# ---------------------------------------------------------------------------
+@router.get("/stats/history")
+async def stats_history(hours: int = 24, admin: dict = Depends(require_admin)):
+    hours = max(1, min(hours, 72))
+    async with get_db() as db:
+        enabled = await get_setting(db, "stats_debug", "0")
+        rows = await get_stats_history(db, hours=hours) if enabled == "1" else []
+    return {"enabled": enabled == "1", "hours": hours, "points": rows}
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +226,7 @@ async def get_settings_endpoint(admin: dict = Depends(require_admin)):
 @router.post("/settings")
 async def update_settings_endpoint(body: UpdateSettingsRequest,
                                     admin: dict = Depends(require_admin)):
-    ALLOWED_SETTINGS = {"test_seeds", "telegram_bot_token", "telegram_chat_id"}
+    ALLOWED_SETTINGS = {"test_seeds", "telegram_bot_token", "telegram_chat_id", "stats_debug"}
     db_settings = {}
     for key, value in body.settings.items():
         if key == "partx_start":
@@ -284,3 +298,12 @@ async def test_status_endpoint(admin: dict = Depends(require_admin)):
 async def admin_list_users(admin: dict = Depends(require_admin)):
     async with get_db() as db:
         return await list_users(db)
+
+
+# ---------------------------------------------------------------------------
+# Gate Monitor (in-memory, realtime)
+# ---------------------------------------------------------------------------
+@router.get("/gate-stats")
+async def admin_gate_stats(admin: dict = Depends(require_admin)):
+    from app.workers.trainer_router import get_gate_stats
+    return get_gate_stats()

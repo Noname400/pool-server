@@ -3,6 +3,7 @@ import { getMachines, machineCommand, getMachineDetail } from '../../api/client'
 import Modal from '../../components/Modal';
 
 const DOT = 14;
+const BLOCK_SIZE = 20;
 
 function MachineDetailModal({ machineId, onClose }) {
   const [machine, setMachine] = useState(null);
@@ -83,13 +84,11 @@ function MachineDetailModal({ machineId, onClose }) {
   );
 }
 
-function serverScore(gpus) {
-  let score = 0;
-  for (const m of gpus) {
-    if (!m.online) score += 10;
-    else if (!m.verified) score += 5;
-  }
-  return score;
+function isStaleOffline(m) {
+  if (m.online) return false;
+  if (!m.last_seen) return true;
+  const age = Date.now() - new Date(m.last_seen).getTime();
+  return age > 3600_000;
 }
 
 export default function Machines() {
@@ -99,8 +98,9 @@ export default function Machines() {
   const [error, setError] = useState(null);
   const [filter, setFilter] = useState('all');
   const [search, setSearch] = useState('');
-  const [sortBy, setSortBy] = useState('problems');
+  const [sortBy, setSortBy] = useState('status');
   const [tooltip, setTooltip] = useState(null);
+  const [showStaleOffline, setShowStaleOffline] = useState(false);
 
   const load = useCallback(async () => {
     try { setMachines(await getMachines()); }
@@ -120,60 +120,59 @@ export default function Machines() {
     return m;
   }, [machines]);
 
+  const staleCount = useMemo(() => machines.filter(isStaleOffline).length, [machines]);
   const totalOnline = useMemo(() => machines.filter(m => m.online).length, [machines]);
   const totalOffline = machines.length - totalOnline;
   const totalUnverified = useMemo(() => machines.filter(m => m.online && !m.verified).length, [machines]);
   const totalGpus = useMemo(() => machines.reduce((s, m) => s + (m.gpu_count || 1), 0), [machines]);
 
-  const servers = useMemo(() => {
-    const byIp = new Map();
-    machines.forEach(m => {
-      const ip = m.ip || 'unknown';
-      if (!byIp.has(ip)) byIp.set(ip, []);
-      byIp.get(ip).push(m);
-    });
+  const visibleMachines = useMemo(() => {
+    let list = [...machines];
 
-    let entries = [...byIp.entries()].map(([ip, gpus]) => {
-      gpus.sort((a, b) => {
-        if (a.online !== b.online) return b.online ? 1 : -1;
-        if (a.verified !== b.verified) return a.verified ? -1 : 1;
-        return (a.machine_id || '').localeCompare(b.machine_id || '');
-      });
+    if (!showStaleOffline) {
+      list = list.filter(m => !isStaleOffline(m));
+    }
 
-      const totalCards = gpus.reduce((s, g) => s + (g.gpu_count || 1), 0);
-      const onCount = gpus.filter(g => g.online).reduce((s, g) => s + (g.gpu_count || 1), 0);
-      const offCount = totalCards - onCount;
-      const unvCount = gpus.filter(g => g.online && !g.verified).length;
-      const gpuName = gpus.find(g => g.gpu_name)?.gpu_name || '—';
-      const hostname = gpus[0]?.hostname || gpus[0]?.machine_id?.slice(0, 12) || ip;
-      const score = serverScore(gpus);
-      const gpuUnits = gpus.flatMap(g => Array(g.gpu_count || 1).fill(g));
-
-      return { ip, gpus, gpuUnits, totalCards, onCount, offCount, unvCount, gpuName, hostname, score };
-    });
-
-    if (filter === 'online') entries = entries.filter(s => s.onCount > 0);
-    if (filter === 'offline') entries = entries.filter(s => s.offCount > 0);
-    if (filter === 'unverified') entries = entries.filter(s => s.unvCount > 0);
+    if (filter === 'online') list = list.filter(m => m.online);
+    if (filter === 'offline') list = list.filter(m => !m.online);
+    if (filter === 'unverified') list = list.filter(m => m.online && !m.verified);
 
     if (search) {
       const q = search.toLowerCase();
-      entries = entries.filter(s =>
-        s.ip.includes(q) ||
-        s.hostname.toLowerCase().includes(q) ||
-        s.gpuName.toLowerCase().includes(q) ||
-        s.gpus.some(g => (g.machine_id || '').toLowerCase().includes(q))
+      list = list.filter(m =>
+        (m.ip || '').toLowerCase().includes(q) ||
+        (m.hostname || '').toLowerCase().includes(q) ||
+        (m.gpu_name || '').toLowerCase().includes(q) ||
+        (m.machine_id || '').toLowerCase().includes(q)
       );
     }
 
-    const stable = (a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }) || a.hostname.localeCompare(b.hostname);
-    if (sortBy === 'problems') entries.sort((a, b) => b.score - a.score || b.totalCards - a.totalCards || stable(a, b));
-    else if (sortBy === 'name') entries.sort((a, b) => a.hostname.localeCompare(b.hostname) || stable(a, b));
-    else if (sortBy === 'ip') entries.sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }) || a.hostname.localeCompare(b.hostname));
-    else if (sortBy === 'gpus') entries.sort((a, b) => b.totalCards - a.totalCards || stable(a, b));
+    const stableId = (a, b) => (a.machine_id || '').localeCompare(b.machine_id || '');
 
-    return entries;
-  }, [machines, filter, search, sortBy]);
+    if (sortBy === 'status') {
+      list.sort((a, b) => {
+        const ao = a.online ? 0 : 1;
+        const bo = b.online ? 0 : 1;
+        return ao - bo || stableId(a, b);
+      });
+    } else if (sortBy === 'ip') {
+      list.sort((a, b) => (a.ip || '').localeCompare(b.ip || '', undefined, { numeric: true }) || stableId(a, b));
+    } else if (sortBy === 'gpus') {
+      list.sort((a, b) => (b.gpu_count || 1) - (a.gpu_count || 1) || stableId(a, b));
+    } else if (sortBy === 'name') {
+      list.sort((a, b) => (a.hostname || '').localeCompare(b.hostname || '') || stableId(a, b));
+    }
+
+    return list;
+  }, [machines, filter, search, sortBy, showStaleOffline]);
+
+  const blocks = useMemo(() => {
+    const result = [];
+    for (let i = 0; i < visibleMachines.length; i += BLOCK_SIZE) {
+      result.push(visibleMachines.slice(i, i + BLOCK_SIZE));
+    }
+    return result;
+  }, [visibleMachines]);
 
   const handleDotOver = useCallback((e) => {
     const mid = e.target.dataset?.mid;
@@ -194,9 +193,9 @@ export default function Machines() {
   }, []);
 
   const filterBtns = [
-    { key: 'all', label: 'All', count: machines.length, color: 'var(--cyan)' },
+    { key: 'all', label: 'All', count: machines.length - (showStaleOffline ? 0 : staleCount), color: 'var(--cyan)' },
     { key: 'online', label: 'Online', count: totalOnline, color: 'var(--green)' },
-    { key: 'offline', label: 'Offline', count: totalOffline, color: 'var(--red)' },
+    { key: 'offline', label: 'Offline', count: totalOffline - (showStaleOffline ? 0 : staleCount), color: 'var(--red)' },
     { key: 'unverified', label: 'Unverif', count: totalUnverified, color: 'var(--yellow)' },
   ];
 
@@ -210,9 +209,22 @@ export default function Machines() {
           <h2 style={{ marginBottom: '0.2rem' }}>
             Fleet
             <span style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', fontWeight: 400, marginLeft: '0.75rem' }}>
-              {servers.length} servers · {totalGpus} GPUs
+              {visibleMachines.length} machines · {totalGpus} GPUs
             </span>
           </h2>
+          <div style={{ display: 'flex', gap: '1rem', marginTop: '0.5rem', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: '0.82rem', fontWeight: 700, color: 'var(--green)' }}>
+              {totalOnline} Online
+            </span>
+            {totalUnverified > 0 && (
+              <span style={{ fontSize: '0.82rem', fontWeight: 700, color: 'var(--yellow)' }}>
+                {totalUnverified} Unverified
+              </span>
+            )}
+            <span style={{ fontSize: '0.82rem', fontWeight: 700, color: totalOffline > 0 ? 'var(--red)' : 'var(--text-muted)' }}>
+              {totalOffline} Offline
+            </span>
+          </div>
           {machines.length > 0 && (
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginTop: '0.4rem' }}>
               <div style={{ width: 200, height: 6, borderRadius: 3, background: 'rgba(255,255,255,0.05)', overflow: 'hidden' }}>
@@ -268,7 +280,7 @@ export default function Machines() {
           className="filter-select"
           style={{ minWidth: '100px' }}
         >
-          <option value="problems">Problems first</option>
+          <option value="status">By status</option>
           <option value="name">By name</option>
           <option value="ip">By IP</option>
           <option value="gpus">By GPU count</option>
@@ -279,75 +291,58 @@ export default function Machines() {
 
       {loading ? (
         <div className="spinner-container"><div className="spinner" /></div>
-      ) : servers.length === 0 ? (
+      ) : visibleMachines.length === 0 ? (
         <div style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-muted)' }}>
-          {machines.length === 0 ? 'No machines connected' : 'No servers match filters'}
+          {machines.length === 0 ? 'No machines connected' : 'No machines match filters'}
         </div>
       ) : (
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
-          gap: '0.6rem',
-        }}>
-          {servers.map(srv => {
-            const pct = srv.totalCards > 0 ? Math.round((srv.onCount / srv.totalCards) * 100) : 0;
-            const hasProblem = srv.offCount > 0 || srv.unvCount > 0;
-            const borderColor = hasProblem
-              ? (srv.offCount > 0 ? 'rgba(239,68,68,0.35)' : 'rgba(234,179,8,0.3)')
-              : 'var(--border)';
-            const barColor = pct === 100 ? 'var(--green)' : pct > 50 ? 'var(--yellow)' : 'var(--red)';
-
-            return (
-              <div
-                key={srv.ip}
-                className="fleet-tile"
-                style={{ borderColor }}
-              >
-                {/* Server header */}
-                <div style={{ marginBottom: '0.4rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-                    <span className="fleet-tile-name" title={srv.hostname}>{srv.hostname}</span>
-                    <span className="fleet-tile-count" style={{
-                      color: pct === 100 ? 'var(--green)' : srv.offCount > 0 ? 'var(--red)' : 'var(--text-secondary)'
-                    }}>
-                      {srv.onCount}<span style={{ opacity: 0.4 }}>/{srv.totalCards}</span>
-                    </span>
-                  </div>
-                  <div className="text-mono" style={{ fontSize: '0.68rem', color: 'var(--text-muted)', marginTop: '1px' }}>
-                    {srv.ip}
-                  </div>
-                </div>
-
-                {/* GPU type line */}
-                <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginBottom: '0.4rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {srv.gpuName} ×{srv.totalCards}
-                </div>
-
-                {/* Bar */}
-                <div className="fleet-tile-bar">
-                  <div className="fleet-tile-bar-fill" style={{ width: `${pct}%`, background: barColor }} />
-                </div>
-
-                {/* GPU dots */}
-                <div
-                  className="fleet-grid"
-                  style={{ gridTemplateColumns: `repeat(auto-fill, ${DOT}px)`, marginTop: '0.5rem' }}
-                  onMouseOver={handleDotOver}
-                  onMouseOut={handleDotOut}
-                  onClick={handleDotClick}
-                >
-                  {srv.gpuUnits.map((m, idx) => (
-                    <div
-                      key={`${m.machine_id}-${idx}`}
-                      data-mid={m.machine_id}
-                      className={`mdot ${m.online ? (m.verified ? 'on' : 'unv') : 'off'}`}
-                      style={{ width: DOT, height: DOT }}
-                    />
-                  ))}
-                </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+          {blocks.map((block, blockIdx) => (
+            <div key={blockIdx} className="card" style={{ padding: '0.75rem 1rem' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+                <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontWeight: 600 }}>
+                  {blockIdx * BLOCK_SIZE + 1}–{blockIdx * BLOCK_SIZE + block.length}
+                </span>
+                <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                  {block.filter(m => m.online).length}/{block.length} online
+                </span>
               </div>
-            );
-          })}
+              <div
+                className="fleet-grid"
+                style={{ gridTemplateColumns: `repeat(auto-fill, ${DOT}px)` }}
+                onMouseOver={handleDotOver}
+                onMouseOut={handleDotOut}
+                onClick={handleDotClick}
+              >
+                {block.map(m => (
+                  <div
+                    key={m.machine_id}
+                    data-mid={m.machine_id}
+                    className={`mdot ${m.online ? (m.verified ? 'on' : 'unv') : 'off'}`}
+                    style={{ width: DOT, height: DOT }}
+                  />
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Show offline toggle */}
+      {staleCount > 0 && (
+        <div style={{ textAlign: 'center', marginTop: '1rem' }}>
+          <button
+            onClick={() => setShowStaleOffline(!showStaleOffline)}
+            style={{
+              padding: '0.4rem 1rem', borderRadius: '2rem', cursor: 'pointer',
+              border: '1px solid var(--border)', fontSize: '0.78rem', fontWeight: 600,
+              background: showStaleOffline ? 'rgba(239,68,68,0.1)' : 'transparent',
+              color: showStaleOffline ? 'var(--red)' : 'var(--text-muted)',
+              transition: 'all 150ms',
+            }}
+          >
+            {showStaleOffline ? 'Hide' : 'Show'} offline ({staleCount})
+          </button>
         </div>
       )}
 
@@ -359,6 +354,9 @@ export default function Machines() {
           </div>
           <div style={{ color: 'var(--text-secondary)' }}>
             {tooltip.m.gpu_name || '—'} · {tooltip.m.gpu_mem_mb ? `${tooltip.m.gpu_mem_mb} MB` : '—'}
+          </div>
+          <div className="text-mono" style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>
+            {tooltip.m.ip || '—'} · {tooltip.m.hostname || '—'}
           </div>
           <div style={{ color: 'var(--text-muted)', fontSize: '0.68rem' }}>
             {tooltip.m.version || '—'}

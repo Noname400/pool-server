@@ -106,6 +106,20 @@ CREATE TABLE IF NOT EXISTS test_items (
     found_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_test_status ON test_items(status);
+
+CREATE TABLE IF NOT EXISTS stats_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL DEFAULT (datetime('now')),
+    completed INTEGER NOT NULL DEFAULT 0,
+    inflight INTEGER NOT NULL DEFAULT 0,
+    ready_queue INTEGER NOT NULL DEFAULT 0,
+    requeued_total INTEGER NOT NULL DEFAULT 0,
+    found_keys INTEGER NOT NULL DEFAULT 0,
+    machines_online INTEGER NOT NULL DEFAULT 0,
+    machines_total INTEGER NOT NULL DEFAULT 0,
+    step INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_stats_history_ts ON stats_history(ts);
 """
 
 
@@ -463,3 +477,39 @@ async def check_all_seeds_found(db: aiosqlite.Connection, machine_id: str) -> bo
     cursor = await db.execute("SELECT COUNT(*) FROM machine_verify WHERE machine_id = ? AND found = 0", (machine_id,))
     row = await cursor.fetchone()
     return row[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Stats History (debug snapshots)
+# ---------------------------------------------------------------------------
+async def insert_stats_snapshot(
+    db: aiosqlite.Connection,
+    completed: int, inflight: int, ready_queue: int,
+    requeued_total: int, found_keys: int,
+    machines_online: int, machines_total: int, step: int,
+):
+    await db.execute(
+        "INSERT INTO stats_history (ts, completed, inflight, ready_queue, requeued_total, "
+        "found_keys, machines_online, machines_total, step) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (_now(), completed, inflight, ready_queue, requeued_total,
+         found_keys, machines_online, machines_total, step),
+    )
+    await db.commit()
+
+
+async def get_stats_history(db: aiosqlite.Connection, hours: int = 24, limit: int = 1500) -> list[dict]:
+    cursor = await db.execute(
+        "SELECT * FROM stats_history WHERE ts >= datetime('now', ?) ORDER BY ts ASC LIMIT ?",
+        (f"-{hours} hours", limit),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def cleanup_stats_history(db: aiosqlite.Connection, keep_hours: int = 24) -> int:
+    cursor = await db.execute(
+        "DELETE FROM stats_history WHERE ts < datetime('now', ?)",
+        (f"-{keep_hours} hours",),
+    )
+    await db.commit()
+    return cursor.rowcount

@@ -8,9 +8,11 @@ machine verification milestones, and test_mode flow.
 import asyncio
 import hmac
 import logging
+import random
 import time
 
 from fastapi import APIRouter, HTTPException, Request, status
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.cache import keydb
@@ -81,9 +83,10 @@ def _safe_int_header(request: Request, name: str, default: int = 0) -> int:
         return default
 
 
-async def _auto_register(request: Request, machine_id: str):
+async def _auto_register(request: Request, machine_id: str, gpu_count_hint: int = 0):
     """Write SQLite only every _DB_WRITE_INTERVAL seconds.
     KeyDB alive touch is done inside the hot-path Lua script, not here.
+    gpu_count_hint: inferred from get_number count param when header is missing.
     """
     now = time.monotonic()
     last = _machine_last_db_write.get(machine_id, 0)
@@ -93,7 +96,7 @@ async def _auto_register(request: Request, machine_id: str):
     hostname = request.headers.get("X-Hostname", "").strip() or machine_id
     ip = _real_ip(request)
     gpu_name = request.headers.get("X-GPU-Name", "").strip() or None
-    gpu_count = _safe_int_header(request, "X-GPU-Count", 0)
+    gpu_count = _safe_int_header(request, "X-GPU-Count", 0) or gpu_count_hint
     gpu_mem = _safe_int_header(request, "X-GPU-Mem", 0) or None
     version = request.headers.get("X-Version", "").strip() or None
 
@@ -175,7 +178,7 @@ async def get_number(request: Request, count: int = 1):
 
     if count == 0:
         await keydb.touch_machine(machine_id, ttl=settings.MACHINE_ALIVE_TTL)
-        await _auto_register(request, machine_id)
+        await _auto_register(request, machine_id, gpu_count_hint=0)
         return _empty_response("ok")
 
     # Fast path: verified machine, no test mode — single Lua round-trip
@@ -189,8 +192,7 @@ async def get_number(request: Request, count: int = 1):
             expire_ts=now + ttl,
             key_ttl=ttl * 3,
         )
-        # SQLite registration throttled in background
-        await _auto_register(request, machine_id)
+        await _auto_register(request, machine_id, gpu_count_hint=count)
 
         if tag == "CMD":
             return _empty_response(payload)
@@ -201,7 +203,7 @@ async def get_number(request: Request, count: int = 1):
 
     # Slow path: DB checks for test mode / verification
     await keydb.touch_machine(machine_id, ttl=settings.MACHINE_ALIVE_TTL)
-    await _auto_register(request, machine_id)
+    await _auto_register(request, machine_id, gpu_count_hint=count)
 
     cmd = await keydb.get_pending_command(machine_id)
     if cmd:
@@ -254,30 +256,112 @@ async def mark_done(request: Request, body: MarkDoneRequest):
     if not nums:
         return {"ok": True, "count": 0}
 
-    if not body.leases:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="leases dict is required (v3 protocol). "
-            "Send the leases from get_number response.",
-        )
+    if body.leases:
+        entries = []
+        for n in nums:
+            lid = body.leases.get(str(n))
+            if lid:
+                entries.append((n, lid, machine_id))
 
-    entries = []
+        acked, rejected, already_done = await keydb.lease_ack(entries)
+
+        if rejected > 0:
+            logger.warning("mark_done: %d rejected (invalid lease) from %s", rejected, machine_id)
+
+        if acked > 0 and await _is_test_mode_cached():
+            async with get_db() as db:
+                for n in nums:
+                    await mark_test_done(db, n)
+
+        return {"ok": True, "success": True, "count": acked, "rejected": rejected, "already_done": already_done}
+
+    # Legacy v2 path: trainer binary doesn't send leases yet.
+    # Accept but skip lease validation — just remove from inflight and count.
+    logger.info("mark_done legacy (no leases) from %s: %d nums", machine_id, len(nums))
+    r = keydb.get_keydb()
+    pipe = r.pipeline()
     for n in nums:
-        lid = body.leases.get(str(n))
-        if lid:
-            entries.append((n, lid, machine_id))
+        pipe.zrem("pool:inflight", str(n))
+        pipe.delete(f"pool:lease:{n}")
+    await pipe.execute()
+    await r.incrby("completed:count", len(nums))
 
-    acked, rejected, already_done = await keydb.lease_ack(entries)
-
-    if rejected > 0:
-        logger.warning("mark_done: %d rejected (invalid lease) from %s", rejected, machine_id)
-
-    if acked > 0 and await _is_test_mode_cached():
+    if await _is_test_mode_cached():
         async with get_db() as db:
             for n in nums:
                 await mark_test_done(db, n)
 
-    return {"ok": True, "success": True, "count": acked, "rejected": rejected, "already_done": already_done}
+    return {"ok": True, "success": True, "count": len(nums)}
+
+
+# ---------------------------------------------------------------------------
+# Маршруты для симулятора (trainer_gate). НЕ ТРОГАЮТ get_number/mark_done и пул.
+# In-memory статистика — никуда не пишется, только для мониторинга.
+# ---------------------------------------------------------------------------
+_gate_stats = {
+    "get_task": 0,
+    "task_done": 0,
+    "chunk": 0,
+    "bytes_sent": 0,
+    "first_seen": 0.0,
+    "last_seen": 0.0,
+    "machines": set(),
+}
+_gate_stats_lock = asyncio.Lock()
+
+
+async def _gate_touch(endpoint: str, machine_id: str = "", extra_bytes: int = 0):
+    async with _gate_stats_lock:
+        now = time.time()
+        _gate_stats[endpoint] += 1
+        _gate_stats["bytes_sent"] += extra_bytes
+        _gate_stats["last_seen"] = now
+        if _gate_stats["first_seen"] == 0:
+            _gate_stats["first_seen"] = now
+        if machine_id:
+            _gate_stats["machines"].add(machine_id)
+
+
+def get_gate_stats() -> dict:
+    s = _gate_stats.copy()
+    s["machines"] = len(_gate_stats["machines"])
+    now = time.time()
+    uptime = now - s["first_seen"] if s["first_seen"] else 0
+    s["uptime_sec"] = round(uptime, 1)
+    s["rps"] = round((s["get_task"] + s["task_done"] + s["chunk"]) / uptime, 2) if uptime > 1 else 0
+    return s
+
+
+@router.get("/bbdata/get_task")
+async def sim_get_task(request: Request, count: int = 1):
+    """Симулятор: фейковые задачи. Не выделяет реальные X из пула."""
+    machine_id = _check_token(request)
+    count = max(1, min(count, 100))
+    nums = [random.randint(1000000, 9999999) for _ in range(count)]
+    leases = {str(n): f"sim-{n}" for n in nums}
+    await _gate_touch("get_task", machine_id)
+    return {"numbers": nums, "leases": leases, "lease_ttl": 60, "command": "work"}
+
+
+@router.post("/bbdata/task_done")
+async def sim_task_done(request: Request):
+    """Симулятор: принимает body, но не трогает пул (нет KeyDB, нет SQLite)."""
+    machine_id = _check_token(request)
+    await request.body()
+    await _gate_touch("task_done", machine_id)
+    return {"ok": True, "count": 0}
+
+
+@router.get("/bbdata/chunk")
+async def sim_chunk(request: Request, min_bytes: int = 256, max_bytes: int = 8192):
+    """Для симулятора: произвольные бинарные данные небольшого разного размера."""
+    machine_id = _check_token(request)
+    lo = max(64, min(min_bytes, max_bytes))
+    hi = min(65536, max(min_bytes, max_bytes))
+    size = random.randint(lo, hi) if lo <= hi else lo
+    data = bytes(random.getrandbits(8) for _ in range(size))
+    await _gate_touch("chunk", machine_id, size)
+    return Response(content=data, media_type="application/octet-stream")
 
 
 # ---------------------------------------------------------------------------
