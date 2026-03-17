@@ -142,6 +142,7 @@ async def init_db() -> None:
         except Exception:
             pass
 
+        await db.execute("DELETE FROM settings WHERE key = 'machine_denylist'")
         await db.commit()
     logger.info("SQLite initialized: %s (WAL mode)", _db_path)
 
@@ -310,8 +311,14 @@ async def list_machines(db: aiosqlite.Connection) -> list[dict]:
 async def update_machine(db: aiosqlite.Connection, machine_id: str, **fields) -> bool:
     if not fields:
         return False
-    sets = ", ".join(f"{k} = ?" for k in fields)
-    vals = list(fields.values()) + [machine_id]
+
+    allowed = {"name", "tags", "pending_command"}
+    safe_fields = {k: v for k, v in fields.items() if k in allowed}
+    if not safe_fields:
+        return False
+
+    sets = ", ".join(f"{k} = ?" for k in safe_fields)
+    vals = list(safe_fields.values()) + [machine_id]
     cursor = await db.execute(f"UPDATE machines SET {sets} WHERE machine_id = ?", vals)
     await db.commit()
     return cursor.rowcount > 0

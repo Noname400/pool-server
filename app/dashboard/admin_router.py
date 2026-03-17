@@ -92,7 +92,8 @@ async def admin_machine_detail(machine_id: str, admin: dict = Depends(require_ad
         machine = await get_machine(db, machine_id)
         if not machine:
             raise HTTPException(status_code=404, detail="Machine not found")
-    machine["online"] = await keydb.is_machine_alive(machine_id)
+    alive = await keydb.get_alive_machines()
+    machine["online"] = machine_id in alive
     return machine
 
 

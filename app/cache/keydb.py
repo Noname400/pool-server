@@ -30,7 +30,7 @@ _scripts: dict[str, Any] = {}
 
 
 async def init_keydb() -> None:
-    global _pool
+    global _pool, _scripts
     settings = get_settings()
     _pool = redis.from_url(
         settings.KEYDB_URL,
@@ -39,15 +39,20 @@ async def init_keydb() -> None:
         socket_timeout=10.0,
         socket_connect_timeout=5.0,
     )
+    # Script objects are bound to a specific client connection pool.
+    # Drop cached script wrappers on reconnect/reinit.
+    _scripts = {}
     await _pool.ping()
+    await _pool.delete("pool:deny:machines")
     logger.info("KeyDB connected: %s", settings.KEYDB_URL)
 
 
 async def close_keydb() -> None:
-    global _pool
+    global _pool, _scripts
     if _pool:
         await _pool.aclose()
         _pool = None
+    _scripts = {}
 
 
 def get_keydb() -> redis.Redis:
@@ -106,9 +111,11 @@ async def ensure_step_above_start() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Machine liveness (TTL-based auto-expire)
+# Machine liveness (TTL-based auto-expire + hysteresis grace period)
 # ---------------------------------------------------------------------------
-async def touch_machine(machine_id: str, ttl: int = 60) -> None:
+_ONLINE_GRACE_SEC = 60
+
+async def touch_machine(machine_id: str, ttl: int = 180) -> None:
     r = get_keydb()
     await r.set(f"alive:{machine_id}", "1", ex=ttl)
 
@@ -121,6 +128,7 @@ async def is_machine_alive(machine_id: str) -> bool:
 _alive_cache: set[str] = set()
 _alive_cache_ts: float = 0
 _ALIVE_CACHE_TTL = 3
+_last_seen_alive: dict[str, float] = {}
 
 
 async def get_alive_machines() -> set[str]:
@@ -129,10 +137,23 @@ async def get_alive_machines() -> set[str]:
     if now - _alive_cache_ts < _ALIVE_CACHE_TTL and _alive_cache_ts > 0:
         return _alive_cache
     r = get_keydb()
-    keys = []
+    keys: list[str] = []
     async for key in r.scan_iter("alive:*", count=1000):
         keys.append(key.removeprefix("alive:"))
-    _alive_cache = set(keys)
+
+    current = set(keys)
+    for mid in current:
+        _last_seen_alive[mid] = now
+
+    grace_cutoff = now - _ONLINE_GRACE_SEC
+    graced = {mid for mid, ts in _last_seen_alive.items() if ts >= grace_cutoff}
+    result = current | graced
+
+    stale = [mid for mid, ts in _last_seen_alive.items() if ts < grace_cutoff]
+    for mid in stale:
+        del _last_seen_alive[mid]
+
+    _alive_cache = result
     _alive_cache_ts = now
     return _alive_cache
 

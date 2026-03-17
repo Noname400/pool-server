@@ -25,9 +25,18 @@ from app.cache import keydb
 from app.cache.keydb import close_keydb, init_keydb, is_keydb_healthy
 from app.config import get_settings
 from app.dashboard.admin_router import router as admin_router
-from app.db.sqlite import close_db_pool, create_api_key, create_user, get_db, get_setting, init_db, list_users
+from app.db.sqlite import (
+    close_db_pool,
+    create_api_key,
+    create_user,
+    get_db,
+    get_setting,
+    init_db,
+    list_users,
+)
 from app.export_router import router as export_router
 from app.security.middleware import setup_middleware
+from app.workers.partx_generator import refill_ready_queue
 from app.workers.trainer_router import router as trainer_router
 
 logging.basicConfig(
@@ -56,6 +65,13 @@ async def _restore_keydb_state():
     if completed == 0 and saved_completed > 0:
         await keydb.set_completed_count(saved_completed)
         logger.info("Restored KeyDB completed count from SQLite: %d", saved_completed)
+
+    ready = await keydb.get_ready_count()
+    inflight = await keydb.get_inflight_count()
+    if ready == 0 and inflight == 0:
+        added = await refill_ready_queue(batch=5000)
+        if added > 0:
+            logger.info("Primed ready queue after startup/reset: %d X values", added)
 
 
 @asynccontextmanager

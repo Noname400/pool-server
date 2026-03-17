@@ -36,6 +36,22 @@ def _client_ip(request: Request) -> str:
     ).strip()
 
 
+def _parse_expires_at(value: str) -> datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    # SQLite/Javascript formats may use trailing "Z", normalize for fromisoformat.
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 async def _resolve_api_key(token: str, request: Request) -> tuple[dict, str]:
     prefix = token[:4] if len(token) >= 4 else token
     async with get_db() as db:
@@ -51,7 +67,10 @@ async def _resolve_api_key(token: str, request: Request) -> tuple[dict, str]:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
         if api_key.get("expires_at"):
-            exp = datetime.fromisoformat(api_key["expires_at"])
+            exp = _parse_expires_at(api_key["expires_at"])
+            if exp is None:
+                _logger.warning("Invalid expires_at for api key id=%s", api_key["id"])
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
             if exp < datetime.now(timezone.utc):
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key expired")
 

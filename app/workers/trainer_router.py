@@ -166,6 +166,7 @@ async def legacy_heartbeat(request: Request):
     if token and machine_id and settings.TRAINER_AUTH_TOKEN:
         if hmac.compare_digest(token, settings.TRAINER_AUTH_TOKEN):
             await keydb.touch_machine(machine_id, ttl=settings.MACHINE_ALIVE_TTL)
+            await _auto_register(request, machine_id)
     return {"status": "ok", "commands": []}
 
 
@@ -252,46 +253,35 @@ async def mark_done(request: Request, body: MarkDoneRequest):
     await keydb.touch_machine(machine_id, ttl=settings.MACHINE_ALIVE_TTL)
     await _auto_register(request, machine_id)
 
-    nums = body.nums or ([body.num] if body.num is not None else [])
+    nums_raw = body.nums or ([body.num] if body.num is not None else [])
+    nums = list(dict.fromkeys(nums_raw))
     if not nums:
         return {"ok": True, "count": 0}
 
-    if body.leases:
-        entries = []
-        for n in nums:
-            lid = body.leases.get(str(n))
-            if lid:
-                entries.append((n, lid, machine_id))
-
-        acked, rejected, already_done = await keydb.lease_ack(entries)
-
-        if rejected > 0:
-            logger.warning("mark_done: %d rejected (invalid lease) from %s", rejected, machine_id)
-
-        if acked > 0 and await _is_test_mode_cached():
+    if not body.leases:
+        if await _is_test_mode_cached():
             async with get_db() as db:
                 for n in nums:
                     await mark_test_done(db, n)
+            return {"ok": True, "success": True, "count": len(nums), "mode": "test"}
+        raise HTTPException(status_code=400, detail="leases are required")
 
-        return {"ok": True, "success": True, "count": acked, "rejected": rejected, "already_done": already_done}
+    missing = [n for n in nums if str(n) not in body.leases]
+    if missing:
+        raise HTTPException(status_code=400, detail="Missing lease ids for some numbers")
 
-    # Legacy v2 path: trainer binary doesn't send leases yet.
-    # Accept but skip lease validation — just remove from inflight and count.
-    logger.info("mark_done legacy (no leases) from %s: %d nums", machine_id, len(nums))
-    r = keydb.get_keydb()
-    pipe = r.pipeline()
-    for n in nums:
-        pipe.zrem("pool:inflight", str(n))
-        pipe.delete(f"pool:lease:{n}")
-    await pipe.execute()
-    await r.incrby("completed:count", len(nums))
+    entries = [(n, body.leases[str(n)], machine_id) for n in nums]
+    acked, rejected, already_done = await keydb.lease_ack(entries)
 
-    if await _is_test_mode_cached():
+    if rejected > 0:
+        logger.warning("mark_done: %d rejected (invalid lease) from %s", rejected, machine_id)
+
+    if acked > 0 and rejected == 0 and already_done == 0 and await _is_test_mode_cached():
         async with get_db() as db:
             for n in nums:
                 await mark_test_done(db, n)
 
-    return {"ok": True, "success": True, "count": len(nums)}
+    return {"ok": True, "success": True, "count": acked, "rejected": rejected, "already_done": already_done}
 
 
 # ---------------------------------------------------------------------------

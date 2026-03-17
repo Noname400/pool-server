@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     TRAINER_AUTH_TOKEN: str = ""
     EXPORT_TOKEN: str = ""
 
-    MACHINE_ALIVE_TTL: int = 60
+    MACHINE_ALIVE_TTL: int = 180
 
     LEASE_TTL: int = 60
     REQUEUE_INTERVAL: int = 5
